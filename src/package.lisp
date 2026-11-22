@@ -25,6 +25,10 @@
            #:encode-resp3-to-string
            #:decode-resp3-from-string
            #:encode-resp3-command
+           #:encode-resp3-to-octets
+           #:decode-resp3-from-octets
+           #:*max-bulk-length*
+           #:*max-line-length*
 
            #:+cas-lua+
 

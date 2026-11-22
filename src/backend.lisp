@@ -23,7 +23,7 @@
     ((stringp value) value)
     ((integerp value) (princ-to-string value))
     ((and (vectorp value) (not (stringp value)))
-     (map 'string #'code-char value))
+     (%utf8-string value))
     (t value)))
 
 (defun %command (backend parts)
@@ -32,7 +32,8 @@
     (cond
       (fn (funcall fn parts))
       (stream
-       (write-string (encode-resp3-command parts) stream)
+       ;; STREAM is an (unsigned-byte 8) (or bivalent) socket stream.
+       (write-sequence (encode-resp3-command parts) stream)
        (force-output stream)
        (decode-resp3 stream))
       (t (error 'cache-error :message "redis-cache-backend has no stream or send-fn")))))

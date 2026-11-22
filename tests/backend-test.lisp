@@ -47,13 +47,13 @@
     (incf now 6)
     (ok (null (cache-protocol:cache-get c "k")))))
 
-(deftest stream-roundtrip-via-string-streams
+(deftest stream-roundtrip-via-wire-octets
   (let* ((fake (make-fake-redis))
          (c (make-redis-cache-backend
              :send-fn
              (lambda (parts)
                (let ((wire (encode-resp3-command parts)))
-                 (let ((decoded (decode-resp3-from-string wire)))
+                 (let ((decoded (decode-resp3-from-octets wire)))
                    (fake-redis-dispatch fake decoded)))))))
     (cache-protocol:cache-put c "s" "z")
     (ok (string= "z" (cache-protocol:cache-get c "s")))))

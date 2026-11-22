@@ -49,6 +49,7 @@
 
 (deftest resp3-command
   (let ((wire (encode-resp3-command '("GET" "k"))))
-    (ok (char= #\* (char wire 0)))
-    (let ((v (decode-resp3-from-string wire)))
+    (ok (= (char-code #\*) (aref wire 0)))
+    (ok (typep wire '(vector (unsigned-byte 8))))
+    (let ((v (decode-resp3-from-octets wire)))
       (ok (equal '("GET" "k") v)))))
