@@ -1,6 +1,7 @@
 (in-package #:cache-backend-redis)
 
-;;; RESP3 codec over a character or binary stream.
+;;; RESP3 codec over an (unsigned-byte 8) stream. Text is UTF-8 (encoding-protocol);
+;;; blob lengths are octet counts, as the protocol requires.
 ;;; Types: simple string, error, integer, blob, array, null, map, set, bool, double.
 
 (defconstant +resp-null+ :resp-null)
@@ -44,138 +45,228 @@
 (defun make-resp-set (members)
   (make-instance 'resp-set :members members))
 
+(defconstant +cr+ 13)
+(defconstant +lf+ 10)
+
+(defparameter *max-bulk-length* (* 512 1024 1024)
+  "Largest blob length accepted when decoding (Redis proto-max-bulk-len default).")
+
+(defparameter *max-line-length* (* 64 1024)
+  "Largest header / simple-string line accepted when decoding.")
+
+;;; --- octets ----------------------------------------------------------------
+
+(defun %utf8-octets (string)
+  "STRING → UTF-8 octets through encoding-protocol."
+  (encoding-protocol:encode string :encoding :utf-8))
+
+(defun %utf8-string (octets)
+  "UTF-8 OCTETS → string. Invalid UTF-8 signals CACHE-ERROR with a USE-VALUE
+restart (e.g. to keep the raw octets)."
+  (handler-case (encoding-protocol:decode octets :encoding :utf-8)
+    (encoding-protocol:encoding-error (e)
+      (restart-case
+          (error 'cache-error
+                 :message (format nil "RESP3 reply is not valid UTF-8: ~a" e))
+        (use-value (value)
+          :report "Return a supplied value (e.g. the raw octets) instead."
+          value)))))
+
+(defun %write-ascii (string stream)
+  (loop for c across string do (write-byte (char-code c) stream)))
+
 (defun %write-crlf (stream)
-  (write-char #\Return stream)
-  (write-char #\Newline stream))
+  (write-byte +cr+ stream)
+  (write-byte +lf+ stream))
 
-(defun %utf8 (x)
+(defun %write-header (type-char n stream)
+  (write-byte (char-code type-char) stream)
+  (%write-ascii (princ-to-string n) stream)
+  (%write-crlf stream))
+
+(defun %write-line-value (type-char string stream)
+  "Simple string / error: a single line, so CR or LF in it would end the
+frame early and let the rest be read as another reply. Refuse them."
+  (when (find-if (lambda (c) (member c '(#\Return #\Newline))) string)
+    (error 'cache-error
+           :message (format nil "RESP3 ~a line contains CR/LF: ~s" type-char string)))
+  (write-byte (char-code type-char) stream)
+  (write-sequence (%utf8-octets string) stream)
+  (%write-crlf stream))
+
+(defun %write-blob (octets stream)
+  (%write-header #\$ (length octets) stream)
+  (write-sequence octets stream)
+  (%write-crlf stream))
+
+(defun %part-octets (x)
+  "A command part as octets: strings UTF-8, octet vectors as is."
   (etypecase x
-    (string x)
-    ((vector (unsigned-byte 8)) (map 'string #'code-char x))
-    (symbol (string x))
-    (integer (princ-to-string x))))
+    (string (%utf8-octets x))
+    ((vector (unsigned-byte 8)) (coerce x '(simple-array (unsigned-byte 8) (*))))
+    (symbol (%utf8-octets (string x)))
+    (integer (%utf8-octets (princ-to-string x)))))
 
-(defun encode-resp3 (value &optional (stream *standard-output*))
-  "Write VALUE as RESP3. Strings default to bulk strings; wrap with
-   MAKE-RESP-SIMPLE-STRING for `+` simple strings."
+;;; --- encode ----------------------------------------------------------------
+
+(defun encode-resp3 (value stream)
+  "Write VALUE as RESP3 to the (unsigned-byte 8) STREAM. Strings are bulk
+strings: UTF-8 octets prefixed with their octet count. Wrap with
+MAKE-RESP-SIMPLE-STRING for `+` simple strings."
   (cond
     ((eq value :resp-null)
-     (write-string "_" stream) (%write-crlf stream))
+     (%write-ascii "_" stream) (%write-crlf stream))
     ((eq value :resp-true)
-     (write-string "#t" stream) (%write-crlf stream))
+     (%write-ascii "#t" stream) (%write-crlf stream))
     ((eq value :resp-false)
-     (write-string "#f" stream) (%write-crlf stream))
+     (%write-ascii "#f" stream) (%write-crlf stream))
     ((resp-error-p value)
-     (write-char #\- stream)
-     (write-string (resp-error-message value) stream)
-     (%write-crlf stream))
+     (%write-line-value #\- (resp-error-message value) stream))
     ((resp-simple-string-p value)
-     (write-char #\+ stream)
-     (write-string (resp-simple-string-value value) stream)
-     (%write-crlf stream))
+     (%write-line-value #\+ (resp-simple-string-value value) stream))
     ((integerp value)
-     (write-char #\: stream)
-     (princ value stream)
+     (%write-ascii (format nil ":~d" value) stream)
      (%write-crlf stream))
     ((floatp value)
-     (write-char #\, stream)
-     (let ((*read-default-float-format* 'double-float))
-       (princ value stream))
+     (%write-ascii (let ((*read-default-float-format* 'double-float))
+                     (format nil ",~a" (float value 1d0)))
+                   stream)
      (%write-crlf stream))
     ((resp-map-p value)
      (let ((pairs (resp-map-pairs value)))
-       (write-char #\% stream)
-       (princ (length pairs) stream)
-       (%write-crlf stream)
+       (%write-header #\% (length pairs) stream)
        (dolist (pair pairs)
          (encode-resp3 (car pair) stream)
          (encode-resp3 (cdr pair) stream))))
     ((resp-set-p value)
      (let ((mem (resp-set-members value)))
-       (write-char #\~ stream)
-       (princ (length mem) stream)
-       (%write-crlf stream)
+       (%write-header #\~ (length mem) stream)
        (dolist (m mem) (encode-resp3 m stream))))
-    ((and (vectorp value) (not (stringp value)))
-     (write-char #\$ stream)
-     (princ (length value) stream)
-     (%write-crlf stream)
-     (loop for b across value do (write-char (code-char b) stream))
-     (%write-crlf stream))
+    ((typep value '(vector (unsigned-byte 8)))
+     (%write-blob value stream))
     ((stringp value)
-     (write-char #\$ stream)
-     (princ (length value) stream)
-     (%write-crlf stream)
-     (write-string value stream)
-     (%write-crlf stream))
+     (%write-blob (%utf8-octets value) stream))
     ((listp value)
-     (write-char #\* stream)
-     (princ (length value) stream)
-     (%write-crlf stream)
+     (%write-header #\* (length value) stream)
      (dolist (elt value) (encode-resp3 elt stream)))
     (t (error 'cache-error
               :message (format nil "cannot encode ~s as RESP3" value))))
   value)
 
+(defun encode-resp3-to-octets (value)
+  "VALUE as RESP3 wire octets."
+  (coerce (flexi-streams:with-output-to-sequence (sink)
+            (encode-resp3 value sink))
+          '(simple-array (unsigned-byte 8) (*))))
+
 (defun encode-resp3-to-string (value)
-  (with-output-to-string (s)
-    (encode-resp3 value s)))
+  "VALUE's RESP3 wire octets decoded as UTF-8 (for display and tests; blob
+lengths are octet counts, not character counts)."
+  (encoding-protocol:decode (encode-resp3-to-octets value) :encoding :utf-8))
 
 (defun encode-resp3-command (parts)
-  "Encode a Redis command (list of strings) as a RESP3 array of bulk strings."
-  (encode-resp3-to-string (mapcar #'%utf8 parts)))
+  "Encode a Redis command (list of strings / octet vectors / integers) as the
+wire octets of a RESP3 array of bulk strings."
+  (encode-resp3-to-octets (mapcar #'%part-octets parts)))
 
-(defun %read-line-crlf (stream)
-  (let ((line (read-line stream nil :eof)))
-    (when (eq line :eof)
-      (error 'cache-error :message "unexpected EOF decoding RESP3"))
-    (string-right-trim '(#\Return) line)))
+;;; --- decode ----------------------------------------------------------------
+
+(defun %eof ()
+  (error 'cache-error :message "unexpected EOF decoding RESP3"))
+
+(defun %read-line-octets (stream)
+  "Octets up to CRLF (CRLF consumed, not returned). A bare LF is accepted
+as the terminator; a CR not followed by LF is a protocol error."
+  (let ((out (make-array 16 :element-type '(unsigned-byte 8)
+                            :adjustable t :fill-pointer 0)))
+    (loop
+      (let ((b (read-byte stream nil nil)))
+        (cond
+          ((null b) (%eof))
+          ((= b +cr+)
+           (let ((n (read-byte stream nil nil)))
+             (cond ((null n) (%eof))
+                   ((= n +lf+) (return out))
+                   (t (error 'cache-error :message "RESP3 CR not followed by LF")))))
+          ((= b +lf+) (return out))
+          ((>= (length out) *max-line-length*)
+           (error 'cache-error :message "RESP3 line too long"))
+          (t (vector-push-extend b out)))))))
 
 (defun %parse-int (s)
   (parse-integer s :junk-allowed t))
 
+(defun %ascii (octets &key (start 0))
+  (map 'string #'code-char (subseq octets start)))
+
+(defun %read-blob (stream n)
+  (when (> n *max-bulk-length*)
+    (error 'cache-error :message (format nil "RESP3 blob length ~d too large" n)))
+  (let ((buf (make-array n :element-type '(unsigned-byte 8))))
+    (unless (= n (read-sequence buf stream))
+      (%eof))
+    (let ((cr (read-byte stream nil nil))
+          (lf (read-byte stream nil nil)))
+      (unless (and (eql cr +cr+) (eql lf +lf+))
+        (error 'cache-error
+               :message "RESP3 blob not followed by CRLF (length mismatch)")))
+    buf))
+
 (defun decode-resp3 (stream)
-  "Read one RESP3 value from STREAM."
-  (let* ((line (%read-line-crlf stream))
-         (type (if (plusp (length line)) (char line 0)
-                   (error 'cache-error :message "empty RESP3 line")))
-         (rest (subseq line 1)))
-    (ecase type
-      (#\+ (make-resp-simple-string rest))
-      (#\- (make-resp-error rest))
-      (#\: (%parse-int rest))
-      (#\$
-       (let ((n (%parse-int rest)))
-         (if (or (null n) (< n 0))
-             :resp-null
-             (let ((buf (make-string n)))
-               (read-sequence buf stream)
-               (%read-line-crlf stream)
-               buf))))
-      (#\*
-       (let ((n (%parse-int rest)))
-         (if (or (null n) (< n 0))
-             :resp-null
-             (loop repeat n collect (decode-resp3 stream)))))
-      (#\_ :resp-null)
-      (#\#
-       (cond
-         ((or (string-equal rest "t") (string= rest "t")) :resp-true)
-         ((or (string-equal rest "f") (string= rest "f")) :resp-false)
-         (t (error 'cache-error :message (format nil "bad RESP3 bool ~s" rest)))))
-      (#\,
-       (let* ((*read-default-float-format* 'double-float)
-              (n (read-from-string rest)))
-         (float n 1.0d0)))
-      (#\%
-       (let ((n (%parse-int rest)))
-         (make-resp-map
-          (loop repeat n
-                collect (cons (decode-resp3 stream) (decode-resp3 stream))))))
-      (#\~
-       (let ((n (%parse-int rest)))
-         (make-resp-set (loop repeat n collect (decode-resp3 stream))))))))
+  "Read one RESP3 value from the (unsigned-byte 8) STREAM. Blob strings are
+read by their octet length, then decoded as UTF-8."
+  (let* ((line (%read-line-octets stream))
+         (type (if (plusp (length line)) (code-char (aref line 0))
+                   (error 'cache-error :message "empty RESP3 line"))))
+    (flet ((rest-text () (%utf8-string (subseq line 1)))
+           (rest-ascii () (%ascii line :start 1)))
+      (case type
+        (#\+ (make-resp-simple-string (rest-text)))
+        (#\- (make-resp-error (rest-text)))
+        (#\: (%parse-int (rest-ascii)))
+        (#\$
+         (let ((n (%parse-int (rest-ascii))))
+           (if (or (null n) (< n 0))
+               :resp-null
+               (%utf8-string (%read-blob stream n)))))
+        (#\*
+         (let ((n (%parse-int (rest-ascii))))
+           (if (or (null n) (< n 0))
+               :resp-null
+               (loop repeat n collect (decode-resp3 stream)))))
+        (#\_ :resp-null)
+        (#\#
+         (let ((rest (rest-ascii)))
+           (cond
+             ((string-equal rest "t") :resp-true)
+             ((string-equal rest "f") :resp-false)
+             (t (error 'cache-error :message (format nil "bad RESP3 bool ~s" rest))))))
+        (#\,
+         (let* ((rest (rest-ascii))
+                (*read-default-float-format* 'double-float)
+                (*read-eval* nil)
+                (n (read-from-string rest)))
+           (unless (realp n)
+             (error 'cache-error :message (format nil "bad RESP3 double ~s" rest)))
+           (float n 1.0d0)))
+        (#\%
+         (let ((n (or (%parse-int (rest-ascii)) 0)))
+           (make-resp-map
+            (loop repeat n
+                  collect (let* ((k (decode-resp3 stream))
+                                 (v (decode-resp3 stream)))
+                            (cons k v))))))
+        (#\~
+         (let ((n (or (%parse-int (rest-ascii)) 0)))
+           (make-resp-set (loop repeat n collect (decode-resp3 stream)))))
+        (t (error 'cache-error
+                  :message (format nil "unknown RESP3 type byte ~s" type)))))))
+
+(defun decode-resp3-from-octets (octets)
+  "Decode one RESP3 value from wire OCTETS."
+  (decode-resp3 (flexi-streams:make-in-memory-input-stream
+                 (coerce octets '(vector (unsigned-byte 8))))))
 
 (defun decode-resp3-from-string (string)
-  (with-input-from-string (s string)
-    (decode-resp3 s)))
+  "Decode one RESP3 value from STRING, taken as the UTF-8 text of the wire."
+  (decode-resp3-from-octets (%utf8-octets string)))
