@@ -144,13 +144,11 @@ between threads."))
 
 (defmacro %with-transport-errors ((backend) &body body)
   "Run BODY; a socket, stream or TLS failure becomes CACHE-CONNECTION-ERROR
-with the original condition as its CAUSE."
+with the original condition as its CAUSE (the report prints it)."
   `(handler-case (progn ,@body)
      ;; cl+ssl exports no base condition; CL+SSL-ERROR is its root.
      ((or usocket:socket-error usocket:ns-error stream-error cl+ssl::cl+ssl-error) (e)
-       (error 'cache-connection-error
-              :message (format nil "~A: ~A" (%endpoint ,backend) e)
-              :cause e))))
+       (error 'cache-connection-error :message (%endpoint ,backend) :cause e))))
 
 (defun %drop-connection (backend)
   "Close the managed connection, if any. A caller's :STREAM is left alone."
