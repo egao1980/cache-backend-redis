@@ -172,7 +172,10 @@ wire octets of a RESP3 array of bulk strings."
 ;;; --- decode ----------------------------------------------------------------
 
 (defun %eof ()
-  (error 'cache-error :message "unexpected EOF decoding RESP3"))
+  ;; The server closed the connection (or a reply was cut short): a
+  ;; transport failure, which a managed connection recovers from by
+  ;; reconnecting.
+  (error 'cache-connection-error :message "unexpected EOF decoding RESP3"))
 
 (defun %read-line-octets (stream)
   "Octets up to CRLF (CRLF consumed, not returned). A bare LF is accepted
@@ -214,22 +217,35 @@ as the terminator; a CR not followed by LF is a protocol error."
 
 (defun decode-resp3 (stream)
   "Read one RESP3 value from the (unsigned-byte 8) STREAM. Blob strings are
-read by their octet length, then decoded as UTF-8."
+read by their octet length, then decoded as UTF-8. Verbatim strings lose
+their 3-letter format prefix, blob errors become RESP-ERROR, big numbers
+are integers, and an attribute map before a reply is skipped."
   (let* ((line (%read-line-octets stream))
          (type (if (plusp (length line)) (code-char (aref line 0))
                    (error 'cache-error :message "empty RESP3 line"))))
     (flet ((rest-text () (%utf8-string (subseq line 1)))
-           (rest-ascii () (%ascii line :start 1)))
+           (rest-ascii () (%ascii line :start 1))
+           (blob ()
+             (let ((n (%parse-int (%ascii line :start 1))))
+               (if (or (null n) (< n 0))
+                   nil
+                   (%utf8-string (%read-blob stream n))))))
       (case type
         (#\+ (make-resp-simple-string (rest-text)))
         (#\- (make-resp-error (rest-text)))
         (#\: (%parse-int (rest-ascii)))
-        (#\$
-         (let ((n (%parse-int (rest-ascii))))
-           (if (or (null n) (< n 0))
-               :resp-null
-               (%utf8-string (%read-blob stream n)))))
-        (#\*
+        (#\( (or (%parse-int (rest-ascii))
+                 (error 'cache-error :message (format nil "bad RESP3 big number ~s"
+                                                      (rest-ascii)))))
+        (#\$ (or (blob) :resp-null))
+        (#\! (make-resp-error (or (blob) "")))
+        (#\=
+         (let ((text (or (blob) "")))
+           ;; "txt:..." / "mkd:...": the first four characters are the format.
+           (if (and (>= (length text) 4) (char= #\: (char text 3)))
+               (subseq text 4)
+               text)))
+        ((#\* #\>)
          (let ((n (%parse-int (rest-ascii))))
            (if (or (null n) (< n 0))
                :resp-null
@@ -238,9 +254,9 @@ read by their octet length, then decoded as UTF-8."
         (#\#
          (let ((rest (rest-ascii)))
            (cond
-             ((string-equal rest "t") :resp-true)
-             ((string-equal rest "f") :resp-false)
-             (t (error 'cache-error :message (format nil "bad RESP3 bool ~s" rest))))))
+            ((string-equal rest "t") :resp-true)
+            ((string-equal rest "f") :resp-false)
+            (t (error 'cache-error :message (format nil "bad RESP3 bool ~s" rest))))))
         (#\,
          (let* ((rest (rest-ascii))
                 (*read-default-float-format* 'double-float)
@@ -256,6 +272,11 @@ read by their octet length, then decoded as UTF-8."
                   collect (let* ((k (decode-resp3 stream))
                                  (v (decode-resp3 stream)))
                             (cons k v))))))
+        (#\|
+         ;; Attribute map: auxiliary data for the reply that follows.
+         (let ((n (or (%parse-int (rest-ascii)) 0)))
+           (loop repeat (* 2 n) do (decode-resp3 stream))
+           (decode-resp3 stream)))
         (#\~
          (let ((n (or (%parse-int (rest-ascii)) 0)))
            (make-resp-set (loop repeat n collect (decode-resp3 stream)))))
