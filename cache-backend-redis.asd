@@ -12,13 +12,14 @@
   :in-order-to ((test-op (test-op "cache-backend-redis/tests"))))
 
 (defsystem "cache-backend-redis/tests"
-  :depends-on ("cache-backend-redis" "encoding-protocol" "flexi-streams" "rove")
+  :depends-on ("cache-backend-redis" "encoding-protocol" "flexi-streams" "rove" "usocket")
   :pathname "tests"
   :serial t
   :components ((:file "package")
                (:file "resp3-test")
                (:file "backend-test")
-               (:file "wire-test"))
+               (:file "wire-test")
+               (:file "connect-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
