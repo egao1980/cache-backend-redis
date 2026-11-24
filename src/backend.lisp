@@ -24,7 +24,7 @@ milliseconds or \"\" (no expiry). → 1 when swapped, else 0.")
     ((resp-error-p value)
      (error 'cache-error :message (resp-error-message value)))
     ((stringp value) value)
-    ((integerp value) (princ-to-string value))
+    ((integerp value) (%wire-text value))
     ((and (vectorp value) (not (stringp value)))
      (%utf8-string value))
     (t value)))
@@ -43,11 +43,11 @@ non-positive TTL is sent as is, and the server refuses it."
   (check-type ttl (or null real))
   (cond
    ((null ttl) nil)
-   ((integerp ttl) (list "EX" (princ-to-string ttl)))
-   (t (list "PX" (princ-to-string (%ttl-milliseconds ttl))))))
+   ((integerp ttl) (list "EX" (%wire-text ttl)))
+   (t (list "PX" (%wire-text (%ttl-milliseconds ttl))))))
 
 (defmethod cache-put ((cache redis-cache-backend) key value &key ttl)
-  (%command cache (append (list "SET" key (princ-to-string value))
+  (%command cache (append (list "SET" key (%wire-text value))
                           (%expiry-args ttl)))
   value)
 
@@ -59,7 +59,7 @@ non-positive TTL is sent as is, and the server refuses it."
   (check-type delta integer)
   (let ((reply (%command cache (if (= delta 1)
                                    (list "INCR" key)
-                                   (list "INCRBY" key (princ-to-string delta))))))
+                                   (list "INCRBY" key (%wire-text delta))))))
     (unless (integerp reply)
       (error 'cache-error :key key
                           :message (format nil "INCR replied ~s" reply)))
