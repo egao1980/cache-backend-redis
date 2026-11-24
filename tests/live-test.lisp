@@ -21,6 +21,19 @@
             "INCR of \"abc\" signals")
         (ok (equal "abc" (cache-protocol:cache-get c key)) "the connection is still usable")))))
 
+(deftest live-incr-matches-the-fake-server
+  ;; *INCR-CASES* (backend-test.lisp) against the real server: the fake
+  ;; server and the in-memory cache are checked against the same table.
+  (with-side (side)
+    (let ((key (%key "incr")))
+      (with-redis-cache (c :host (%live-host) :port (%live-port)
+                           :password (%live-password))
+        (loop for (stored delta expected) in *incr-cases*
+              do (let ((got (%incr-outcome c key stored delta)))
+                   (ok (eql expected got)
+                       (format nil "Valkey: INCRBY ~S ~S → ~S (got ~S)"
+                               stored delta expected got))))))))
+
 (deftest live-fractional-ttl
   (with-side (side)
     (let ((key (%key "px")))

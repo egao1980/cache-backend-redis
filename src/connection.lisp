@@ -2,9 +2,10 @@
 
 ;;; Connection: a backend made with :host / :port (or :url) owns its
 ;;; socket. It connects on first use (usocket; TLS through cl-stack-ssl's
-;;; cl+ssl), sends HELLO 3 with AUTH and SETNAME, then SELECT, and
-;;; reconnects once after a dropped socket. CL:CLOSE releases it. A
-;;; backend made with :stream or :send-fn uses that channel as is.
+;;; cl+ssl), sends HELLO 3 with AUTH and SETNAME, then SELECT, and after a
+;;; dropped socket reconnects and resends up to :RETRIES times (with
+;;; backoff). CL:CLOSE releases it. A backend made with :stream or
+;;; :send-fn uses that channel as is.
 
 (defclass redis-cache-backend (cache-backend)
   ((stream :initarg :stream :accessor redis-cache-backend-stream :initform nil
@@ -21,6 +22,9 @@
    (client-name :initarg :client-name :initform nil)
    (connect-timeout :initarg :connect-timeout :initform 5)
    (retries :initarg :retries :reader redis-cache-backend-retries :initform 1)
+   (retry-delay :initarg :retry-delay :initform 1/10
+                :documentation "Seconds before the second resend, doubled for
+each later one (capped at 2 s). The first resend goes at once.")
    (socket :initform nil :accessor %socket)
    (lock :initform (bt2:make-recursive-lock :name "redis-cache-backend")
          :reader %lock))
@@ -85,17 +89,20 @@ between threads."))
             :tls (string= scheme "rediss")))))
 
 (defun make-redis-cache-backend (&rest args
-                                 &key stream send-fn url host port username
-                                   password db tls (tls-verify :required)
-                                   client-name (connect-timeout 5) (retries 1))
+                                       &key stream send-fn url host port username
+                                       password db tls (tls-verify :required)
+                                       client-name (connect-timeout 5) (retries 1)
+                                       (retry-delay 1/10))
   "A RESP3 backend. Either:
  - :HOST [:PORT 6379] [:USERNAME] [:PASSWORD] [:DB 0] [:TLS] or :URL
    \"redis://user:pass@host:port/db\" (\"rediss://\" for TLS): the backend
    owns a connection. It connects on first use, sends HELLO 3 (with AUTH
-   and SETNAME), SELECT DB, and after a dropped socket reconnects and
-   resends up to RETRIES times. Explicit keywords win over URL parts.
-   TLS-VERIFY is cl+ssl's :VERIFY (:REQUIRED by default). CL:CLOSE or
-   WITH-REDIS-CACHE releases the connection.
+   and SETNAME), SELECT DB. Once it has had a connection, a dropped socket
+   (or a refused reconnect) is retried on a new connection, up to RETRIES
+   resends: the first at once, then after RETRY-DELAY seconds, doubled each
+   time, capped at 2 s. Explicit keywords win over URL parts. TLS-VERIFY is
+   cl+ssl's :VERIFY (:REQUIRED by default). CL:CLOSE or WITH-REDIS-CACHE
+   releases the connection.
  - :STREAM, an (unsigned-byte 8) stream the caller owns, or
  - :SEND-FN, a function of the command list returning the decoded reply."
   (declare (ignore host port username password db tls))
@@ -111,6 +118,7 @@ between threads."))
         (check-type port (integer 0 65535))
         (check-type db (integer 0))
         (check-type retries (integer 0))
+        (check-type retry-delay (real 0))
         (make-instance 'redis-cache-backend
                        :stream stream
                        :send-fn send-fn
@@ -123,7 +131,8 @@ between threads."))
                        :tls-verify tls-verify
                        :client-name client-name
                        :connect-timeout connect-timeout
-                       :retries retries)))))
+                       :retries retries
+                       :retry-delay retry-delay)))))
 
 (defun use-redis-cache-backend (&rest args &key &allow-other-keys)
   (setf cache-protocol:*cache-backend* (apply #'make-redis-cache-backend args)))
@@ -144,11 +153,19 @@ between threads."))
 
 (defmacro %with-transport-errors ((backend) &body body)
   "Run BODY; a socket, stream or TLS failure becomes CACHE-CONNECTION-ERROR
-with the original condition as its CAUSE (the report prints it)."
+with the original condition as its CAUSE (the report prints it). The
+decoder's own CACHE-CONNECTION-ERROR (EOF mid-reply) has no endpoint; it
+is re-signalled with the endpoint, the decoder's condition as its cause."
   `(handler-case (progn ,@body)
      ;; cl+ssl exports no base condition; CL+SSL-ERROR is its root.
      ((or usocket:socket-error usocket:ns-error stream-error cl+ssl::cl+ssl-error) (e)
-       (error 'cache-connection-error :message (%endpoint ,backend) :cause e))))
+       (error 'cache-connection-error :message (%endpoint ,backend) :cause e))
+     (cache-connection-error (e)
+       (if (cache-protocol:cache-connection-error-cause e)
+           (error e)
+           (error 'cache-connection-error
+                  :message (%endpoint ,backend)
+                  :cause (cache-error-message e))))))
 
 (defun %drop-connection (backend)
   "Close the managed connection, if any. A caller's :STREAM is left alone."
@@ -247,34 +264,49 @@ also reads."
           (error 'cache-error
                  :message "redis-cache-backend has no :host, :url, :stream or :send-fn"))))
 
+(defun %retry-pause (backend failed-attempt)
+  "Pause before the resend that follows FAILED-ATTEMPT (0-based). The first
+resend (an idle socket the server dropped) goes at once; later ones wait
+RETRY-DELAY seconds, doubled each time and capped at 2 s, so a server that
+is restarting gets time to come back."
+  (when (plusp failed-attempt)
+    (let ((delay (slot-value backend 'retry-delay)))
+      (when (plusp delay)
+        (sleep (min 2 (* delay (expt 2 (1- failed-attempt)))))))))
+
 (defun %call (backend parts)
   "Send command PARTS and return the raw reply (a RESP-ERROR is returned,
 not signalled). On a managed connection a transport failure drops the
-socket; if the connection had been up, the command is sent again on a
-new one, up to RETRIES times. Past that the CACHE-CONNECTION-ERROR
-propagates with a RECONNECT restart."
+socket. Once a connection has been up (at entry, or opened by an earlier
+attempt of this call), every failure, a refused reconnect included, is
+retried on a new connection, up to RETRIES resends (see %RETRY-PAUSE).
+A backend that never got a connection fails at once. Past that the
+CACHE-CONNECTION-ERROR propagates with a RECONNECT restart."
   (let ((fn (redis-cache-backend-send-fn backend)))
     (if fn
         (funcall fn parts)
         (bt2:with-recursive-lock-held ((%lock backend))
-          (loop for attempt from 0
-                do (let ((was-connected (redis-cache-backend-connected-p backend)))
-                     (restart-case
-                         (handler-bind
-                             ((cache-connection-error
-                                (lambda (e)
-                                  (declare (ignore e))
-                                  (%drop-connection backend)
-                                  (when (and was-connected
-                                             (< attempt (redis-cache-backend-retries backend)))
-                                    (invoke-restart 'reconnect)))))
-                           (return (%roundtrip backend (%ensure-stream backend) parts)))
-                       (reconnect ()
-                         :report "Reconnect to the server and send the command again."
-                         :test (lambda (c)
-                                 (declare (ignore c))
-                                 (%managed-p backend))
-                         nil))))))))
+          (loop with established = (redis-cache-backend-connected-p backend)
+                for attempt from 0
+                do (restart-case
+                       (handler-bind
+                           ((cache-connection-error
+                             (lambda (e)
+                               (declare (ignore e))
+                               (%drop-connection backend)
+                               (when (and established
+                                          (< attempt (redis-cache-backend-retries backend)))
+                                 (invoke-restart 'reconnect)))))
+                         (let ((stream (%ensure-stream backend)))
+                           (when (%managed-p backend)
+                             (setf established t))
+                           (return (%roundtrip backend stream parts))))
+                     (reconnect ()
+                       :report "Reconnect to the server and send the command again."
+                       :test (lambda (c)
+                               (declare (ignore c))
+                               (%managed-p backend))
+                       (%retry-pause backend attempt))))))))
 
 (defun %command (backend parts)
   "Like %CALL, but an error reply signals CACHE-ERROR with the server's text."

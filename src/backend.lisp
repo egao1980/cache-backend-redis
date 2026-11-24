@@ -117,12 +117,18 @@ non-positive TTL is sent as is, and the server refuses it."
   (make-resp-simple-string "OK"))
 
 (defun %fr-integer (text)
-  "TEXT as an integer if it is \"-?[0-9]+\", else NIL (Redis string2ll)."
+  "TEXT as an integer if Redis string2ll reads it, else NIL: an optional
+minus sign, then a non-zero digit and more digits, or a lone \"0\"; the
+value must fit in (signed-byte 64). \"007\" and \"-0\" are refused."
   (and (stringp text)
-       (let ((start (if (and (plusp (length text)) (char= #\- (char text 0))) 1 0)))
-         (and (< start (length text))
+       (let* ((len (length text))
+              (start (if (and (plusp len) (char= #\- (char text 0))) 1 0)))
+         (and (< start len)
+              (or (string= text "0")
+                  (char<= #\1 (char text start) #\9))
               (every (lambda (c) (char<= #\0 c #\9)) (subseq text start))
-              (parse-integer text)))))
+              (let ((n (parse-integer text)))
+                (and (typep n '(signed-byte 64)) n))))))
 
 (defun %fr-expiry (args)
   "Seconds from EX n / PX ms in SET ARGS: NIL, a real, or :invalid."
@@ -139,12 +145,16 @@ non-positive TTL is sent as is, and the server refuses it."
 (defun %fr-incr (server key delta)
   (let* ((cur (%fr-get server key))
          (n (if cur (%fr-integer cur) 0)))
-    (if (null n)
-        (make-resp-error "ERR value is not an integer or out of range")
-        (let ((entry (gethash key (fake-redis-table server))))
-          (setf (gethash key (fake-redis-table server))
-                (cons (princ-to-string (+ n delta)) (and cur (cdr entry))))
-          (+ n delta)))))
+    (cond
+     ((null n)
+      (make-resp-error "ERR value is not an integer or out of range"))
+     ((not (typep (+ n delta) '(signed-byte 64)))
+      (make-resp-error "ERR increment or decrement would overflow"))
+     (t
+      (let ((entry (gethash key (fake-redis-table server))))
+        (setf (gethash key (fake-redis-table server))
+              (cons (princ-to-string (+ n delta)) (and cur (cdr entry))))
+        (+ n delta))))))
 
 (defun %fr-hello (server args)
   "HELLO 3 [AUTH user pass] [SETNAME name] → a RESP3 map, or WRONGPASS / NOAUTH."
@@ -189,7 +199,10 @@ non-positive TTL is sent as is, and the server refuses it."
      ((string= cmd "INCR")
       (%fr-incr server (first args) 1))
      ((string= cmd "INCRBY")
-      (%fr-incr server (first args) (parse-integer (second args))))
+      (let ((delta (%fr-integer (second args))))
+        (if delta
+            (%fr-incr server (first args) delta)
+            (make-resp-error "ERR value is not an integer or out of range"))))
      ((string= cmd "EVAL")
       ;; The +CAS-LUA+ contract: (EVAL script 1 key absent-flag expected new px)
       (destructuring-bind (key absent expected new px)

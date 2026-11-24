@@ -33,7 +33,8 @@ RESP3 Redis / Valkey backend for [`cache-protocol`](https://github.com/egao1980/
 | `:tls` `:tls-verify` | `nil` `:required` | cl+ssl client stream with SNI and hostname check; the OS trust store comes from cl-stack-ssl |
 | `:client-name` | `nil` | `HELLO ... SETNAME` |
 | `:connect-timeout` | `5` | seconds |
-| `:retries` | `1` | resends after a dropped socket |
+| `:retries` | `1` | resends after a dropped socket or a refused reconnect |
+| `:retry-delay` | `1/10` | seconds before the second resend, doubled for each later one (capped at 2 s); the first resend goes at once |
 | `:stream` | | an `(unsigned-byte 8)` stream the caller owns (never closed by the backend) |
 | `:send-fn` | | a function of the command list returning the decoded reply (tests) |
 
@@ -47,7 +48,7 @@ The connection opens on first use. A server without `HELLO` (Redis 5) gets `AUTH
 | server error reply (`WRONGPASS`, `SET ... EX 0`, `INCR` of `"abc"`, script error) | `cache-error` with the server's text and the key |
 | CAS mismatch | `cache-cas-mismatch` with restart `use-value` |
 
-A dropped socket is retried transparently when the connection had been up (up to `:retries` times; like redis-py, a command whose reply was lost may run twice). Past that the `cache-connection-error` carries a `reconnect` restart:
+Once the backend has had a connection, a dropped socket is retried transparently on a new one, up to `:retries` resends. Each resend counts, so `:retries 3` survives a server that drops the idle connection and then the first reconnect while it restarts; a refused reconnect is retried too, after the `:retry-delay` backoff. A backend that never connected fails at once (wrong host or port). Like redis-py, a command whose reply was lost may run twice. Past that the `cache-connection-error` carries a `reconnect` restart:
 
 ```lisp
 (handler-bind ((stack-cache:cache-connection-error
