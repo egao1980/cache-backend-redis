@@ -261,14 +261,16 @@ values masked (redis://user:***@host, see %REDACT-URL)."
                                        (retry-delay 1/10))
   "A RESP3 backend. Either:
  - :HOST [:PORT 6379] [:USERNAME] [:PASSWORD] [:DB 0] [:TLS] or :URL
-   \"redis://user:pass@host:port/db\" (\"rediss://\" for TLS): the backend
-   owns a connection. It connects on first use, sends HELLO 3 (with AUTH
-   and SETNAME), SELECT DB. Once it has had a connection, a dropped socket
-   (or a refused reconnect) is retried on a new connection, up to RETRIES
-   resends: the first at once, then after RETRY-DELAY seconds, doubled each
-   time, capped at 2 s. Explicit keywords win over URL parts. TLS-VERIFY is
-   cl+ssl's :VERIFY (:REQUIRED by default). CL:CLOSE or WITH-REDIS-CACHE
-   releases the connection.
+   \"redis://user:pass@host:port/db\" (\"rediss://\" for TLS; see
+   PARSE-REDIS-URL): the backend owns a connection. It connects on first
+   use, sends HELLO 3 (with AUTH and SETNAME), SELECT DB. Once it has had a
+   connection, a dropped socket (or a refused reconnect) is retried on a
+   new connection, up to RETRIES resends: the first at once, then after
+   RETRY-DELAY seconds, doubled each time, capped at 2 s. CONNECT-TIMEOUT
+   (seconds, NIL for none) bounds the connect, the TLS handshake and each
+   command. Explicit keywords win over URL parts. TLS-VERIFY is cl+ssl's
+   :VERIFY (:REQUIRED by default). CL:CLOSE or WITH-REDIS-CACHE releases
+   the connection.
  - :STREAM, an (unsigned-byte 8) stream the caller owns, or
  - :SEND-FN, a function of the command list returning the decoded reply."
   (declare (ignore host port username password db tls))
@@ -285,6 +287,7 @@ values masked (redis://user:***@host, see %REDACT-URL)."
         (check-type db (integer 0))
         (check-type retries (integer 0))
         (check-type retry-delay (real 0))
+        (check-type connect-timeout (or null (real (0))))
         (make-instance 'redis-cache-backend
                        :stream stream
                        :send-fn send-fn
@@ -331,14 +334,17 @@ reads the socket itself."
         #-sbcl (funcall thunk)
         (funcall thunk))))
 
-(defmacro %with-transport-errors ((backend) &body body)
+(defmacro %with-transport-errors ((backend &key (deadline t)) &body body)
   "Run BODY; a socket, name lookup, stream or TLS failure becomes
 CACHE-CONNECTION-ERROR with the original condition as its CAUSE (the
 report prints it). The decoder's own CACHE-CONNECTION-ERROR (EOF mid-reply)
 has no endpoint; it is re-signalled with the endpoint, the decoder's
-condition as its cause. BODY runs under %CALL-WITH-IO-DEADLINE, and a
-deadline that passes is a transport failure too."
-  `(handler-case (%call-with-io-deadline ,backend (lambda () ,@body))
+condition as its cause. With DEADLINE (the default) BODY runs under
+%CALL-WITH-IO-DEADLINE, and a deadline that passes is a transport failure
+too."
+  `(handler-case ,(if deadline
+                      `(%call-with-io-deadline ,backend (lambda () ,@body))
+                      `(progn ,@body))
      ;; cl+ssl exports no base condition; CL+SSL-ERROR is its root. On
      ;; SBCL usocket leaves some failures unmapped: getaddrinfo's
      ;; EAI_ADDRFAMILY (::1 on a host without IPv6) as
@@ -436,7 +442,9 @@ also reads."
 (defun %connect (backend)
   "Open the managed connection and run the handshake. → the stream."
   (with-slots (host port tls tls-verify connect-timeout) backend
-    (let ((socket (%with-transport-errors (backend)
+    (let ((socket (%with-transport-errors (backend :deadline nil)
+                    ;; usocket's own :TIMEOUT bounds the connect; a deadline around it
+                    ;; would only replace usocket's condition in CAUSE.
                     (usocket:socket-connect host port
                                             :element-type '(unsigned-byte 8)
                                             :timeout connect-timeout

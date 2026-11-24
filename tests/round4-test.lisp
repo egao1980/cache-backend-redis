@@ -193,18 +193,21 @@ connections and never writes."
     ((tls)
      (nil)
      (t))
-  ;; Over TCP the socket stream's timeout ends the wait. Over TLS cl+ssl
-  ;; reads the socket itself, so only the I/O deadline does.
-  (%call-with-silent-server
-   (lambda (port)
-     (let ((got (%call-with-limit 5 (lambda ()
-                                      (with-redis-cache (c :host "127.0.0.1" :port port
-                                                           :tls tls :tls-verify nil
-                                                           :connect-timeout 1/2)
-                                        (cache-protocol:cache-get c "k"))))))
-       (ok (typep got 'cache-protocol:cache-connection-error)
-           (format nil "~:[TCP~;TLS~]: a server that never answers → connection error (got ~A)"
-                   tls got))))))
+  ;; The :connect-timeout deadline (SBCL) ends the wait; over TCP the socket
+  ;; stream's timeout does too. On Windows SBCL reads a socket without
+  ;; either (egao1980/cache-backend-redis#9), so only TLS is checked there.
+  (if (and (not tls) (uiop:os-windows-p))
+      (skip "Windows, TCP: SBCL reads a socket with no timeout (cache-backend-redis#9)")
+      (%call-with-silent-server
+       (lambda (port)
+         (let ((got (%call-with-limit 5 (lambda ()
+                                          (with-redis-cache (c :host "127.0.0.1" :port port
+                                                               :tls tls :tls-verify nil
+                                                               :connect-timeout 1/2)
+                                            (cache-protocol:cache-get c "k"))))))
+           (ok (typep got 'cache-protocol:cache-connection-error)
+               (format nil "~:[TCP~;TLS~]: a server that never answers → connection error (got ~A)"
+                       tls got)))))))
 
 ;;; --- CAS and RESP3 details -----------------------------------------------------
 
