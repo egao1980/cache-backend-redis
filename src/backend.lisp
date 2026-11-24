@@ -71,7 +71,8 @@ non-positive TTL is sent as is, and the server refuses it."
                                      (if (null expected) "1" "0")
                                      (if (null expected) "" (princ-to-string expected))
                                      (princ-to-string new)
-                                     (if ttl (princ-to-string (%ttl-milliseconds ttl)) "")))))
+                                     (if ttl (princ-to-string (%ttl-milliseconds ttl)) ""))
+                         :key key)))
     (cond
      ((and (integerp reply) (plusp reply)) new)
      (t

@@ -76,10 +76,11 @@ runtime failure of this test rather than a compile-time warning."
     (if (eq v :resp-null) nil v)))
 
 (deftest connect-refused-signals-cache-error
-  ;; No service needed: nothing listens on 127.0.0.1:1.
-  (ok (signals (let ((c (%connect :host "127.0.0.1" :port 1)))
+  ;; No service needed: nothing listens on 127.0.0.1:1. The connect timeout
+  ;; is small because on Linux usocket waits it out (cl-stack-systems#81).
+  (ok (signals (let ((c (%connect :host "127.0.0.1" :port 1 :connect-timeout 1/2)))
                  (cache-protocol:cache-get c "k"))
-               'cache-protocol:cache-error)
+        'cache-protocol:cache-error)
       "a refused :host/:port connection signals cache-error"))
 
 (deftest connect-auth-select-db

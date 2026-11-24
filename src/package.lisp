@@ -52,6 +52,7 @@
            #:make-fake-redis
            #:fake-redis-dispatch
            #:fake-redis-send-fn
-           #:fake-redis-password))
+           #:fake-redis-password
+           #:*max-nesting-depth*))
 
 (in-package #:cache-backend-redis)

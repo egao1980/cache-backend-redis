@@ -54,6 +54,15 @@
 (defparameter *max-line-length* (* 64 1024)
   "Largest header / simple-string line accepted when decoding.")
 
+(defparameter *max-nesting-depth* 64
+  "Deepest level a value may sit at in a reply when decoding: a top-level
+value is at level 1, an element of a top-level array (map, set, push
+frame, attribute) at level 2. Redis replies nest a few levels; a deeper
+one is refused with CACHE-ERROR instead of exhausting the stack.")
+
+(defvar *decode-depth* 0
+  "Nesting depth of the value DECODE-RESP3 is reading (1 for a top-level one).")
+
 ;;; --- octets ----------------------------------------------------------------
 
 (defun %utf8-octets (string)
@@ -215,73 +224,119 @@ as the terminator; a CR not followed by LF is a protocol error."
                :message "RESP3 blob not followed by CRLF (length mismatch)")))
     buf))
 
+(defun %decimal-number-p (text)
+  "TEXT is [sign] digits [. digits] [e [sign] digits], with an ASCII digit
+before or after the point."
+  (let ((i 0)
+        (n (length text)))
+    (flet ((sign ()
+             (when (and (< i n) (find (char text i) "+-"))
+               (incf i)))
+           (digits ()
+             (let ((start i))
+               (loop while (and (< i n) (char<= #\0 (char text i) #\9))
+                     do (incf i))
+               (- i start))))
+      (sign)
+      (let* ((int (digits))
+             (frac (if (and (< i n) (char= #\. (char text i)))
+                       (progn (incf i) (digits))
+                       0)))
+        (and (plusp (+ int frac))
+             (or (= i n)
+                 (and (char-equal #\e (char text i))
+                      (progn (incf i) (sign) (plusp (digits)))
+                      (= i n))))))))
+
+(defun %parse-double (text)
+  "RESP3 double TEXT → double-float: a decimal number with an optional
+exponent, or inf / -inf. The reader runs only on a decimal number, with
+standard syntax, so a reply can intern nothing and run no reader macro.
+Anything else (nan included: it has no portable Lisp value) signals
+CACHE-ERROR."
+  (flet ((bad ()
+           (error 'cache-error :message (format nil "bad RESP3 double ~s" text))))
+    (cond
+     ((string-equal text "inf")
+      #+sbcl sb-ext:double-float-positive-infinity
+      #-sbcl (bad))
+     ((string-equal text "-inf")
+      #+sbcl sb-ext:double-float-negative-infinity
+      #-sbcl (bad))
+     ((%decimal-number-p text)
+      (handler-case (with-standard-io-syntax
+                        (let ((*read-default-float-format* 'double-float)
+                              (*read-eval* nil))
+                          (float (read-from-string text) 1d0)))
+        ((or reader-error arithmetic-error) () (bad))))
+     (t (bad)))))
+
 (defun decode-resp3 (stream)
   "Read one RESP3 value from the (unsigned-byte 8) STREAM. Blob strings are
 read by their octet length, then decoded as UTF-8. Verbatim strings lose
 their 3-letter format prefix, blob errors become RESP-ERROR, big numbers
-are integers, and an attribute map before a reply is skipped."
-  (let* ((line (%read-line-octets stream))
-         (type (if (plusp (length line)) (code-char (aref line 0))
-                   (error 'cache-error :message "empty RESP3 line"))))
-    (flet ((rest-text () (%utf8-string (subseq line 1)))
-           (rest-ascii () (%ascii line :start 1))
-           (blob ()
-             (let ((n (%parse-int (%ascii line :start 1))))
-               (if (or (null n) (< n 0))
-                   nil
-                   (%utf8-string (%read-blob stream n))))))
-      (case type
-        (#\+ (make-resp-simple-string (rest-text)))
-        (#\- (make-resp-error (rest-text)))
-        (#\: (%parse-int (rest-ascii)))
-        (#\( (or (%parse-int (rest-ascii))
-                 (error 'cache-error :message (format nil "bad RESP3 big number ~s"
-                                                      (rest-ascii)))))
-        (#\$ (or (blob) :resp-null))
-        (#\! (make-resp-error (or (blob) "")))
-        (#\=
-         (let ((text (or (blob) "")))
-           ;; "txt:..." / "mkd:...": the first four characters are the format.
-           (if (and (>= (length text) 4) (char= #\: (char text 3)))
-               (subseq text 4)
-               text)))
-        ((#\* #\>)
-         (let ((n (%parse-int (rest-ascii))))
-           (if (or (null n) (< n 0))
-               :resp-null
-               (loop repeat n collect (decode-resp3 stream)))))
-        (#\_ :resp-null)
-        (#\#
-         (let ((rest (rest-ascii)))
-           (cond
-            ((string-equal rest "t") :resp-true)
-            ((string-equal rest "f") :resp-false)
-            (t (error 'cache-error :message (format nil "bad RESP3 bool ~s" rest))))))
-        (#\,
-         (let* ((rest (rest-ascii))
-                (*read-default-float-format* 'double-float)
-                (*read-eval* nil)
-                (n (read-from-string rest)))
-           (unless (realp n)
-             (error 'cache-error :message (format nil "bad RESP3 double ~s" rest)))
-           (float n 1.0d0)))
-        (#\%
-         (let ((n (or (%parse-int (rest-ascii)) 0)))
-           (make-resp-map
-            (loop repeat n
-                  collect (let* ((k (decode-resp3 stream))
-                                 (v (decode-resp3 stream)))
-                            (cons k v))))))
-        (#\|
-         ;; Attribute map: auxiliary data for the reply that follows.
-         (let ((n (or (%parse-int (rest-ascii)) 0)))
-           (loop repeat (* 2 n) do (decode-resp3 stream))
-           (decode-resp3 stream)))
-        (#\~
-         (let ((n (or (%parse-int (rest-ascii)) 0)))
-           (make-resp-set (loop repeat n collect (decode-resp3 stream)))))
-        (t (error 'cache-error
-                  :message (format nil "unknown RESP3 type byte ~s" type)))))))
+are integers, and an attribute map before a reply is skipped. Aggregates
+nested deeper than *MAX-NESTING-DEPTH* signal CACHE-ERROR."
+  (let ((*decode-depth* (1+ *decode-depth*)))
+    (when (> *decode-depth* *max-nesting-depth*)
+      (error 'cache-error
+             :message (format nil "RESP3 reply nested deeper than ~D levels"
+                              *max-nesting-depth*)))
+    (let* ((line (%read-line-octets stream))
+           (type (if (plusp (length line)) (code-char (aref line 0))
+                     (error 'cache-error :message "empty RESP3 line"))))
+      (flet ((rest-text () (%utf8-string (subseq line 1)))
+             (rest-ascii () (%ascii line :start 1))
+             (blob ()
+               (let ((n (%parse-int (%ascii line :start 1))))
+                 (if (or (null n) (< n 0))
+                     nil
+                     (%utf8-string (%read-blob stream n))))))
+        (case type
+          (#\+ (make-resp-simple-string (rest-text)))
+          (#\- (make-resp-error (rest-text)))
+          (#\: (%parse-int (rest-ascii)))
+          (#\( (or (%parse-int (rest-ascii))
+                   (error 'cache-error :message (format nil "bad RESP3 big number ~s"
+                                                        (rest-ascii)))))
+          (#\$ (or (blob) :resp-null))
+          (#\! (make-resp-error (or (blob) "")))
+          (#\=
+           (let ((text (or (blob) "")))
+             ;; "txt:..." / "mkd:...": the first four characters are the format.
+             (if (and (>= (length text) 4) (char= #\: (char text 3)))
+                 (subseq text 4)
+                 text)))
+          ((#\* #\>)
+           (let ((n (%parse-int (rest-ascii))))
+             (if (or (null n) (< n 0))
+                 :resp-null
+                 (loop repeat n collect (decode-resp3 stream)))))
+          (#\_ :resp-null)
+          (#\#
+           (let ((rest (rest-ascii)))
+             (cond
+              ((string-equal rest "t") :resp-true)
+              ((string-equal rest "f") :resp-false)
+              (t (error 'cache-error :message (format nil "bad RESP3 bool ~s" rest))))))
+          (#\, (%parse-double (rest-ascii)))
+          (#\%
+           (let ((n (or (%parse-int (rest-ascii)) 0)))
+             (make-resp-map
+              (loop repeat n
+                    collect (let* ((k (decode-resp3 stream))
+                                   (v (decode-resp3 stream)))
+                              (cons k v))))))
+          (#\|
+           ;; Attribute map: auxiliary data for the reply that follows.
+           (let ((n (or (%parse-int (rest-ascii)) 0)))
+             (loop repeat (* 2 n) do (decode-resp3 stream))
+             (decode-resp3 stream)))
+          (#\~
+           (let ((n (or (%parse-int (rest-ascii)) 0)))
+             (make-resp-set (loop repeat n collect (decode-resp3 stream)))))
+          (t (error 'cache-error
+                    :message (format nil "unknown RESP3 type byte ~s" type))))))))
 
 (defun decode-resp3-from-octets (octets)
   "Decode one RESP3 value from wire OCTETS."

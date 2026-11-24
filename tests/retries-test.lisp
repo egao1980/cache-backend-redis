@@ -114,7 +114,7 @@ and been closed."
          (port (ss-port srv))
          (again nil))
     (unwind-protect
-        (with-redis-cache (c :host "127.0.0.1" :port port
+        (with-redis-cache (c :host "127.0.0.1" :port port :connect-timeout 1/2
                              :retries 6 :retry-delay 1/20)
           (%drop-first-connection c srv)
           (stop-scripted-server srv)

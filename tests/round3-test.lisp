@@ -32,13 +32,34 @@
 
 (deftest a-backend-that-never-connected-still-fails-at-once
   ;; :retries applies once the backend has had a connection; a wrong port
-  ;; is reported at once however many retries are allowed.
-  (let* ((listener (usocket:socket-listen "127.0.0.1" 0 :reuse-address t))
-         (port (usocket:get-local-port listener)))
-    (usocket:socket-close listener)
-    (with-redis-cache (c :host "127.0.0.1" :port port :retries 5 :retry-delay 1)
-      (let ((start (get-internal-real-time)))
-        (ok (signals (cache-protocol:cache-get c "k")
-                'cache-protocol:cache-connection-error))
-        (ok (< (/ (- (get-internal-real-time) start) internal-time-units-per-second) 1/2)
-            "no backoff for a backend that never connected")))))
+  ;; is reported after one connect attempt however many retries are allowed.
+  ;; How long one refused connect takes depends on the platform: macOS
+  ;; reports it at once, usocket on Linux waits out the connect timeout
+  ;; (egao1980/cl-stack-systems#81), Windows takes about 2 s (it retries the
+  ;; SYN, and usocket's SBCL backend applies no connect timeout there). So
+  ;; the timeout is explicit and small, and the bound is one measured
+  ;; refused connect plus a margin, well under the 1 s retry delay.
+  (flet ((seconds-since (start)
+           (/ (- (get-internal-real-time) start) internal-time-units-per-second)))
+    (let* ((listener (usocket:socket-listen "127.0.0.1" 0 :reuse-address t))
+           (port (usocket:get-local-port listener))
+           (timeout 1/2))
+      (usocket:socket-close listener)
+      (let ((one-connect (let ((start (get-internal-real-time)))
+                           (handler-case
+                               (usocket:socket-close
+                                (usocket:socket-connect "127.0.0.1" port
+                                                        :element-type '(unsigned-byte 8)
+                                                        :timeout timeout))
+                             ((or usocket:socket-error usocket:ns-error) () nil))
+                           (seconds-since start))))
+        (with-redis-cache (c :host "127.0.0.1" :port port :connect-timeout timeout
+                             :retries 5 :retry-delay 1)
+          (let ((start (get-internal-real-time)))
+            (ok (signals (cache-protocol:cache-get c "k")
+                  'cache-protocol:cache-connection-error))
+            (let ((elapsed (seconds-since start)))
+              (ok (< elapsed (+ one-connect 1/2))
+                  (format nil "no backoff for a backend that never connected ~
+                               (~,2F s; one refused connect takes ~,2F s here)"
+                          elapsed one-connect)))))))))

@@ -41,15 +41,15 @@ between threads."))
 (defmethod print-object ((backend redis-cache-backend) stream)
   (print-unreadable-object (backend stream :type t :identity t)
     (cond
-      ((redis-cache-backend-host backend)
-       (format stream "~:[redis~;rediss~]://~A:~D/~D~:[~; connected~]"
-               (redis-cache-backend-tls backend)
-               (redis-cache-backend-host backend)
-               (redis-cache-backend-port backend)
-               (redis-cache-backend-db backend)
-               (%socket backend)))
-      ((redis-cache-backend-send-fn backend) (write-string "send-fn" stream))
-      ((redis-cache-backend-stream backend) (write-string "stream" stream)))))
+     ((redis-cache-backend-host backend)
+      (format stream "~:[redis~;rediss~]://~A:~D/~D~:[~; connected~]"
+              (redis-cache-backend-tls backend)
+              (%host-text (redis-cache-backend-host backend))
+              (redis-cache-backend-port backend)
+              (redis-cache-backend-db backend)
+              (%socket backend)))
+     ((redis-cache-backend-send-fn backend) (write-string "send-fn" stream))
+     ((redis-cache-backend-stream backend) (write-string "stream" stream)))))
 
 (defun %managed-p (backend)
   (and (redis-cache-backend-host backend) t))
@@ -60,18 +60,111 @@ between threads."))
 
 ;;; --- redis:// URLs -------------------------------------------------------
 
+(defun %url-authority-start (url)
+  "Index just past the :// in URL, or 0 without one."
+  (let ((p (search "://" url)))
+    (if p (+ p 3) 0)))
+
+(defun %mask-query-item (item)
+  "Query ITEM (name=value) for an error report: the value masked, except db's."
+  (let ((eq (position #\= item)))
+    (cond ((zerop (length item)) item)
+          ((and eq (string= "db" item :end2 eq)) item)
+          (eq (concatenate 'string (subseq item 0 (1+ eq)) "***"))
+          (t "***"))))
+
+(defun %userinfo-needs-escaping-p (url)
+  "True when the text of URL between :// and its last @ holds a character
+that a userinfo must percent-encode (RFC 3986 3.2.1 allows unreserved
+characters, sub-delims, : and %XX), or a % without two hex digits: the
+usual cause of a bad redis:// URL that carries a password."
+  (let* ((start (%url-authority-start url))
+         (at (position #\@ url :start start :from-end t)))
+    (and at
+         (loop for i from start below at
+               for c = (char url i)
+               thereis (if (char= c #\%)
+                           (not (and (< (+ i 2) at)
+                                     (digit-char-p (char url (+ i 1)) 16)
+                                     (digit-char-p (char url (+ i 2)) 16)))
+                           (not (or (and (char< c (code-char 128)) (alphanumericp c))
+                                    (find c "-._~!$&'()*+,;=:"))))))))
+
+(defun %url-host (raw)
+  "The host of a URL as quri returns it (RAW), percent-decoded, as usocket
+takes it: an IPv6 literal ([::1], [fe80::1%25en0]) without its brackets.
+→ NIL when RAW is not an IPv6 literal or a host name (letters, digits,
+- . _)."
+  (flet ((decoded (text)
+           (handler-case (encoding-protocol:percent-decode text)
+             (encoding-protocol:encoding-error () nil)))
+         (name-char-p (c)
+           (or (and (char< c (code-char 128)) (alphanumericp c))
+               (find c "-._~"))))
+    (let ((n (length raw)))
+      (if (and (plusp n) (char= #\[ (char raw 0)))
+          (let* ((inner (and (> n 2) (char= #\] (char raw (1- n)))
+                             (decoded (subseq raw 1 (1- n)))))
+                 (zone (and inner (position #\% inner))))
+            (and inner
+                 (find #\: inner :end zone)
+                 (every (lambda (c) (or (digit-char-p c 16) (find c ":.")))
+                        (subseq inner 0 zone))
+                 (or (null zone)
+                     (and (< (1+ zone) (length inner))
+                          (every #'name-char-p (subseq inner (1+ zone)))))
+                 inner))
+          (let ((name (decoded raw)))
+            (and name (plusp (length name))
+                 (every (lambda (c) (and (name-char-p c) (char/= c #\~))) name)
+                 name))))))
+
+(defun %host-text (host)
+  "HOST as an endpoint or URL shows it: an IPv6 address in brackets."
+  (if (find #\: host)
+      (format nil "[~A]" host)
+      host))
+
 (defun %redact-url (url)
-  "URL with any password in its userinfo replaced by ***, for error
-reports: URLs come from configuration and reports end up in logs. The
-userinfo is taken to end at the LAST @, not at the first / ? or #, so a
-password that holds one of those unescaped (base64 passwords hold / + =)
+  "URL for an error report, with whatever may be a secret masked as ***:
+URLs come from configuration, and reports end up in logs. Masked are the
+password in the userinfo (all of the userinfo when it has no colon), a
+port that is not a number (redis://:password with no @host), every query
+value but db's (a redis-py URL may carry ?password=) and the fragment.
+The userinfo is taken to end at the LAST @, not at the first / ? or #, so
+a password that holds one of those unescaped (base64 passwords hold / + =)
 is masked too. This can over-mask a malformed URL, never under-mask it."
-  (let* ((start (let ((p (search "://" url))) (if p (+ p 3) 0)))
+  (let* ((start (%url-authority-start url))
          (at (position #\@ url :start start :from-end t))
-         (colon (and at (position #\: url :start start :end at))))
-    (if colon
-        (concatenate 'string (subseq url 0 (1+ colon)) "***" (subseq url at))
-        url)))
+         (colon (and at (position #\: url :start start :end at)))
+         (host-start (if at (1+ at) start))
+         (host-end (or (position-if (lambda (c) (find c "/?#")) url :start host-start)
+                       (length url)))
+         (bracket (and (< host-start host-end)
+                       (char= #\[ (char url host-start))
+                       (position #\] url :start host-start :end host-end)))
+         (port-colon (position #\: url :start (or bracket host-start) :end host-end))
+         (tail (subseq url host-end))
+         (hash (position #\# tail))
+         (query (position #\? tail :end hash)))
+    (with-output-to-string (out)
+      (write-string url out :end start)
+      (cond (colon (write-string url out :start start :end (1+ colon))
+                   (write-string "***@" out))
+            (at (write-string "***@" out)))
+      (cond ((and port-colon
+                  (notevery #'digit-char-p (subseq url (1+ port-colon) host-end)))
+             (write-string url out :start host-start :end (1+ port-colon))
+             (write-string "***" out))
+            (t (write-string url out :start host-start :end host-end)))
+      (write-string tail out :end (or query hash (length tail)))
+      (when query
+        (format out "?~{~A~^&~}"
+                (mapcar #'%mask-query-item
+                        (uiop:split-string (subseq tail (1+ query) hash)
+                                           :separator "&"))))
+      (when hash
+        (write-string "#***" out)))))
 
 (defun %parse-db (text url)
   (handler-case (let ((n (parse-integer text)))
@@ -82,47 +175,83 @@ is masked too. This can over-mask a malformed URL, never under-mask it."
              :message (format nil "bad database number ~s in ~a" text url)))))
 
 (defun parse-redis-url (url)
-  "Parse redis://[[user]:password@]host[:port][/db] (rediss:// for TLS).
-→ plist :host :port :username :password :db :tls. User and password are
-percent-decoded; / ? # @ and % in them must be percent-encoded, as in any
-URL (redis-py's from_url reads them the same way). Errors are CACHE-ERRORs
-that print the URL with the password masked (redis://user:***@host)."
+  "Parse redis://[[user]:password@]host[:port][/db][?db=N] (rediss:// for
+TLS) the way redis-py's from_url reads it. → plist :host :port :username
+:password :db :tls.
+ - An IPv6 address is written in brackets (redis://[::1]:6379/0) and
+   returned without them, as usocket takes it.
+ - ?db=N wins over the path, as in redis-py (a blank one is ignored, the
+   first one counts). Any other query parameter is refused rather than
+   ignored. A fragment is ignored.
+ - User, password, host, path and query are percent-decoded; / ? # @ and
+   % in a user or password must be percent-encoded, as in any URL.
+Errors are CACHE-ERRORs that print the URL with the password and the query
+values masked (redis://user:***@host, see %REDACT-URL)."
+  (check-type url string)
   (let ((shown (%redact-url url)))
-    (flet ((refuse (what)
-             ;; A URL with userinfo gets the escaping hint: an unescaped
-             ;; / ? # @ or % in a password is the usual cause.
-             (error 'cache-error
-                    :message (format nil "~A: ~A~:[~; (escape % / ? # @ in the user or ~
-                                          password as %25 %2F %3F %23 %40)~]"
-                                     what shown (find #\@ url)))))
+    (labels ((refuse (what)
+               ;; The escaping hint only when the user or password holds a
+               ;; character that must be escaped: then it is the likely cause.
+               (error 'cache-error
+                      :message (format nil "~A: ~A~:[~; (escape % / ? # @ in the user or ~
+                                            password as %25 %2F %3F %23 %40)~]"
+                                       what shown (%userinfo-needs-escaping-p url))))
+             (decode (text &optional plus-as-space)
+               (handler-case (encoding-protocol:percent-decode text :plus-as-space plus-as-space)
+                 (encoding-protocol:encoding-error ()
+                   (refuse "bad percent-encoding in URL"))))
+             (query-db (query)
+               ;; redis-py: query values first; a blank db is ignored, the
+               ;; first one counts, and an unknown name is refused (its
+               ;; ConnectionPool rejects the keyword).
+               (let ((db nil))
+                 (loop for (name . value)
+                         in (and query
+                                 (handler-case (quri:url-decode-params query :percent-decode nil)
+                                   (quri:uri-error () (refuse "malformed query in URL"))))
+                       for key = (decode name t)
+                       for text = (and value (string-trim " " (decode value t)))
+                       do (cond ((string/= key "db")
+                                 (refuse (if value
+                                             (format nil "unsupported query parameter ~S in URL ~
+                                                          (only db is read)"
+                                                     key)
+                                             "unsupported query parameter in URL (only db is read)")))
+                                ((and (null db) (plusp (length text)))
+                                 (setf db (%parse-db text shown)))))
+                 db)))
       (let* ((uri (handler-case (quri:uri url)
-                    (error () (refuse "malformed URL"))))
+                    (quri:uri-error () (refuse "malformed URL"))))
              (scheme (and (quri:uri-scheme uri)
                           (string-downcase (quri:uri-scheme uri)))))
         (unless (member scheme '("redis" "rediss") :test #'equal)
           (refuse "not a redis:// or rediss:// URL"))
-        (unless (and (quri:uri-host uri) (plusp (length (quri:uri-host uri))))
-          (refuse "no host in URL"))
         ;; An unescaped / ? or # in the password ends quri's authority
         ;; early, and the rest (with the @host) lands in the path, query or
         ;; fragment. Refuse that rather than connect to the wrong host.
         (when (some (lambda (part) (find #\@ (or part "")))
                     (list (quri:uri-path uri) (quri:uri-query uri) (quri:uri-fragment uri)))
           (refuse "malformed URL"))
-        (flet ((decode (text)
-                 (handler-case (quri:url-decode text)
-                   (error () (refuse "bad percent-escape in URL")))))
+        (when (zerop (length (quri:uri-host uri)))
+          (refuse "no host in URL"))
+        (let ((host (or (%url-host (quri:uri-host uri))
+                        (refuse "bad host in URL")))
+              (port (or (quri:uri-port uri) 6379)))
+          (unless (typep port '(integer 1 65535))
+            (refuse "bad port in URL"))
           (let* ((userinfo (quri:uri-userinfo uri))
                  (colon (and userinfo (position #\: userinfo)))
                  (user (and userinfo
                             (decode (subseq userinfo 0 (or colon (length userinfo))))))
                  (password (and colon (decode (subseq userinfo (1+ colon)))))
-                 (path (string-trim "/" (or (quri:uri-path uri) ""))))
-            (list :host (quri:uri-host uri)
-                  :port (or (quri:uri-port uri) 6379)
+                 (path (string-trim "/" (decode (or (quri:uri-path uri) ""))))
+                 (path-db (and (plusp (length path)) (%parse-db path shown)))
+                 (query-db (query-db (quri:uri-query uri))))
+            (list :host host
+                  :port port
                   :username (and user (plusp (length user)) user)
                   :password (and password (plusp (length password)) password)
-                  :db (if (plusp (length path)) (%parse-db path shown) 0)
+                  :db (or query-db path-db 0)
                   :tls (string= scheme "rediss"))))))))
 
 (defun make-redis-cache-backend (&rest args
@@ -184,18 +313,34 @@ that print the URL with the password masked (redis://user:***@host)."
 
 (defun %endpoint (backend)
   (if (%managed-p backend)
-      (format nil "~A:~D" (redis-cache-backend-host backend)
+      (format nil "~A:~D" (%host-text (redis-cache-backend-host backend))
               (redis-cache-backend-port backend))
       "redis stream"))
+
+(defun %call-with-io-deadline (backend thunk)
+  "Call THUNK. On SBCL a TLS connection runs it under a deadline of
+CONNECT-TIMEOUT seconds: cl+ssl reads and writes the socket itself, so the
+socket stream's own timeout (which bounds each wait on a plain connection)
+does not apply, and a server that stops answering would block for ever."
+  (let ((seconds (and (redis-cache-backend-tls backend)
+                      (slot-value backend 'connect-timeout))))
+    (if seconds
+        #+sbcl (sb-sys:with-deadline (:seconds seconds) (funcall thunk))
+        #-sbcl (funcall thunk)
+        (funcall thunk))))
 
 (defmacro %with-transport-errors ((backend) &body body)
   "Run BODY; a socket, stream or TLS failure becomes CACHE-CONNECTION-ERROR
 with the original condition as its CAUSE (the report prints it). The
 decoder's own CACHE-CONNECTION-ERROR (EOF mid-reply) has no endpoint; it
-is re-signalled with the endpoint, the decoder's condition as its cause."
-  `(handler-case (progn ,@body)
+is re-signalled with the endpoint, the decoder's condition as its cause.
+BODY runs under %CALL-WITH-IO-DEADLINE, and a deadline that passes is a
+transport failure too."
+  `(handler-case (%call-with-io-deadline ,backend (lambda () ,@body))
      ;; cl+ssl exports no base condition; CL+SSL-ERROR is its root.
-     ((or usocket:socket-error usocket:ns-error stream-error cl+ssl::cl+ssl-error) (e)
+     ((or usocket:socket-error usocket:ns-error stream-error cl+ssl::cl+ssl-error
+          #+sbcl sb-sys:deadline-timeout)
+         (e)
        (error 'cache-connection-error :message (%endpoint ,backend) :cause e))
      (cache-connection-error (e)
        (if (cache-protocol:cache-connection-error-cause e)
@@ -225,10 +370,20 @@ is re-signalled with the endpoint, the decoder's condition as its cause."
   (force-output stream))
 
 (defun %roundtrip (backend stream parts)
-  "Send PARTS on STREAM and read one reply. → raw RESP3 value."
-  (%with-transport-errors (backend)
-    (%write-command stream parts)
-    (decode-resp3 stream)))
+  "Send PARTS on STREAM and read one reply. → raw RESP3 value. When this
+does not complete (a transport or protocol error, or a non-local exit such
+as a timeout around the call), a managed connection is dropped: its stream
+may still hold part of the reply, which the next command would read as its
+own."
+  (let ((done nil))
+    (unwind-protect
+        (multiple-value-prog1
+            (%with-transport-errors (backend)
+              (%write-command stream parts)
+              (decode-resp3 stream))
+          (setf done t))
+      (unless done
+        (%drop-connection backend)))))
 
 (defun %hello-unsupported-p (reply)
   "Redis before 6 has no HELLO; a server without RESP3 answers NOPROTO."
@@ -343,11 +498,12 @@ CACHE-CONNECTION-ERROR propagates with a RECONNECT restart."
                                (%managed-p backend))
                        (%retry-pause backend attempt))))))))
 
-(defun %command (backend parts)
-  "Like %CALL, but an error reply signals CACHE-ERROR with the server's text."
+(defun %command (backend parts &key (key (second parts)))
+  "Like %CALL, but an error reply signals CACHE-ERROR with the server's text
+and KEY (by default the command's first argument)."
   (let ((reply (%call backend parts)))
     (when (resp-error-p reply)
-      (error 'cache-error :key (second parts)
+      (error 'cache-error :key key
                           :message (resp-error-message reply)))
     reply))
 

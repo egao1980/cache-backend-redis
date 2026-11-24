@@ -156,7 +156,7 @@ a time. DROP-AFTER closes the first connection after that many replies."
           (ok (equal "v" got) "a handler can invoke RECONNECT"))))))
 
 (deftest refused-connect-signals-connection-error-with-cause
-  (let ((c (make-redis-cache-backend :host "127.0.0.1" :port 1)))
+  (let ((c (make-redis-cache-backend :host "127.0.0.1" :port 1 :connect-timeout 1/2)))
     (let ((e (handler-case (progn (cache-protocol:cache-get c "k") nil)
                (cache-protocol:cache-connection-error (e) e))))
       (ok e "cache-connection-error")

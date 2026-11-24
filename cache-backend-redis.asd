@@ -3,7 +3,8 @@
   :description "RESP3 Redis/Valkey backend for cache-protocol (host/port or redis:// URL with AUTH, SELECT, TLS; or an injected stream / send-fn)"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "cache-protocol" "0.2.0") "encoding-protocol" "flexi-streams"
+  :depends-on ((:version "cache-protocol" "0.2.0") (:version "encoding-protocol" "0.3.0")
+               "flexi-streams"
                "usocket" "quri" "cl-stack-ssl" "bordeaux-threads")
   :serial t
   :pathname "src"
@@ -28,7 +29,8 @@
                (:file "retries-test")
                (:file "evidence-r2-test")
                (:file "round3-test")
-               (:file "evidence-r3-test"))
+               (:file "evidence-r3-test")
+               (:file "round4-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
