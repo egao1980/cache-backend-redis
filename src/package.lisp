@@ -37,10 +37,22 @@
            #:use-redis-cache-backend
            #:redis-cache-backend-stream
            #:redis-cache-backend-send-fn
+           #:redis-cache-backend-host
+           #:redis-cache-backend-port
+           #:redis-cache-backend-username
+           #:redis-cache-backend-db
+           #:redis-cache-backend-tls
+           #:redis-cache-backend-retries
+           #:redis-cache-backend-connected-p
+           #:parse-redis-url
+           #:with-redis-cache
+           #:reconnect
 
            #:fake-redis
            #:make-fake-redis
            #:fake-redis-dispatch
-           #:fake-redis-send-fn))
+           #:fake-redis-send-fn
+           #:fake-redis-password
+           #:*max-nesting-depth*))
 
 (in-package #:cache-backend-redis)
