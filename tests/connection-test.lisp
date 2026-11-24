@@ -206,6 +206,18 @@ a time. DROP-AFTER closes the first connection after that many replies."
      ("http://localhost") ("redis://h/x") ("redis://h/-1") ("redis:///0"))
   (ok (signals (parse-redis-url url) 'cache-protocol:cache-error) url))
 
+(deftest-parametrize bad-url-errors-mask-the-password
+    ((url shown)
+     ("redis://:s3cret@cache.internal/abc" "redis://:***@cache.internal/abc")
+     ("http://app:s3cret@cache.internal" "http://app:***@cache.internal")
+     ("redis://app:s3cret@/0" "redis://app:***@/0")
+     ("redis://:p@s3cret@h/-1" "redis://:***@h/-1"))
+  ;; #7: URLs come from configuration; reports end up in logs.
+  (let ((text (handler-case (progn (parse-redis-url url) "no error")
+                (cache-protocol:cache-error (e) (princ-to-string e)))))
+    (ok (not (search "s3cret" text)) (format nil "no password in: ~A" text))
+    (ok (search shown text) (format nil "~A shows ~A" text shown))))
+
 (deftest url-and-explicit-keywords
   (let ((c (make-redis-cache-backend :url "rediss://u:p@h:7000/4" :db 9)))
     (ok (equal "h" (redis-cache-backend-host c)))

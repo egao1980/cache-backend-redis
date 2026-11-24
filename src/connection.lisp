@@ -56,6 +56,18 @@ between threads."))
 
 ;;; --- redis:// URLs -------------------------------------------------------
 
+(defun %redact-url (url)
+  "URL with the password in its userinfo replaced by ***, for error
+reports: URLs come from configuration and reports end up in logs."
+  (let* ((start (let ((p (search "://" url))) (if p (+ p 3) 0)))
+         (end (or (position-if (lambda (c) (find c "/?#")) url :start start)
+                  (length url)))
+         (at (position #\@ url :start start :end end :from-end t))
+         (colon (and at (position #\: url :start start :end at))))
+    (if colon
+        (concatenate 'string (subseq url 0 (1+ colon)) "***" (subseq url at))
+        url)))
+
 (defun %parse-db (text url)
   (handler-case (let ((n (parse-integer text)))
                   (check-type n (integer 0))
@@ -66,15 +78,20 @@ between threads."))
 
 (defun parse-redis-url (url)
   "Parse redis://[[user]:password@]host[:port][/db] (rediss:// for TLS).
-→ plist :host :port :username :password :db :tls."
-  (let* ((uri (quri:uri url))
+→ plist :host :port :username :password :db :tls. Errors print the URL
+with the password masked (redis://user:***@host)."
+  (let* ((shown (%redact-url url))
+         (uri (handler-case (quri:uri url)
+                (error ()
+                  (error 'cache-error
+                         :message (format nil "malformed URL: ~a" shown)))))
          (scheme (and (quri:uri-scheme uri)
                       (string-downcase (quri:uri-scheme uri)))))
     (unless (member scheme '("redis" "rediss") :test #'equal)
       (error 'cache-error
-             :message (format nil "not a redis:// or rediss:// URL: ~a" url)))
+             :message (format nil "not a redis:// or rediss:// URL: ~a" shown)))
     (unless (and (quri:uri-host uri) (plusp (length (quri:uri-host uri))))
-      (error 'cache-error :message (format nil "no host in ~a" url)))
+      (error 'cache-error :message (format nil "no host in ~a" shown)))
     (let* ((userinfo (quri:uri-userinfo uri))
            (colon (and userinfo (position #\: userinfo)))
            (user (and userinfo
@@ -85,7 +102,7 @@ between threads."))
             :port (or (quri:uri-port uri) 6379)
             :username (and user (plusp (length user)) user)
             :password (and password (plusp (length password)) password)
-            :db (if (plusp (length path)) (%parse-db path url) 0)
+            :db (if (plusp (length path)) (%parse-db path shown) 0)
             :tls (string= scheme "rediss")))))
 
 (defun make-redis-cache-backend (&rest args
