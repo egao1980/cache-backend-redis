@@ -26,6 +26,10 @@
                 :documentation "Seconds before the second resend, doubled for
 each later one (capped at 2 s). The first resend goes at once.")
    (socket :initform nil :accessor %socket)
+   (ever-connected :initform nil :accessor %ever-connected
+                   :documentation "True once a managed connection has completed its
+handshake. From then on a refused reconnect is retried (see %CALL), in this
+call and in every later one, for the life of the backend; CL:CLOSE keeps it.")
    (lock :initform (bt2:make-recursive-lock :name "redis-cache-backend")
          :reader %lock))
   (:documentation
@@ -57,12 +61,13 @@ between threads."))
 ;;; --- redis:// URLs -------------------------------------------------------
 
 (defun %redact-url (url)
-  "URL with the password in its userinfo replaced by ***, for error
-reports: URLs come from configuration and reports end up in logs."
+  "URL with any password in its userinfo replaced by ***, for error
+reports: URLs come from configuration and reports end up in logs. The
+userinfo is taken to end at the LAST @, not at the first / ? or #, so a
+password that holds one of those unescaped (base64 passwords hold / + =)
+is masked too. This can over-mask a malformed URL, never under-mask it."
   (let* ((start (let ((p (search "://" url))) (if p (+ p 3) 0)))
-         (end (or (position-if (lambda (c) (find c "/?#")) url :start start)
-                  (length url)))
-         (at (position #\@ url :start start :end end :from-end t))
+         (at (position #\@ url :start start :from-end t))
          (colon (and at (position #\: url :start start :end at))))
     (if colon
         (concatenate 'string (subseq url 0 (1+ colon)) "***" (subseq url at))
@@ -78,32 +83,47 @@ reports: URLs come from configuration and reports end up in logs."
 
 (defun parse-redis-url (url)
   "Parse redis://[[user]:password@]host[:port][/db] (rediss:// for TLS).
-→ plist :host :port :username :password :db :tls. Errors print the URL
-with the password masked (redis://user:***@host)."
-  (let* ((shown (%redact-url url))
-         (uri (handler-case (quri:uri url)
-                (error ()
-                  (error 'cache-error
-                         :message (format nil "malformed URL: ~a" shown)))))
-         (scheme (and (quri:uri-scheme uri)
-                      (string-downcase (quri:uri-scheme uri)))))
-    (unless (member scheme '("redis" "rediss") :test #'equal)
-      (error 'cache-error
-             :message (format nil "not a redis:// or rediss:// URL: ~a" shown)))
-    (unless (and (quri:uri-host uri) (plusp (length (quri:uri-host uri))))
-      (error 'cache-error :message (format nil "no host in ~a" shown)))
-    (let* ((userinfo (quri:uri-userinfo uri))
-           (colon (and userinfo (position #\: userinfo)))
-           (user (and userinfo
-                      (quri:url-decode (subseq userinfo 0 (or colon (length userinfo))))))
-           (password (and colon (quri:url-decode (subseq userinfo (1+ colon)))))
-           (path (string-trim "/" (or (quri:uri-path uri) ""))))
-      (list :host (quri:uri-host uri)
-            :port (or (quri:uri-port uri) 6379)
-            :username (and user (plusp (length user)) user)
-            :password (and password (plusp (length password)) password)
-            :db (if (plusp (length path)) (%parse-db path shown) 0)
-            :tls (string= scheme "rediss")))))
+→ plist :host :port :username :password :db :tls. User and password are
+percent-decoded; / ? # @ and % in them must be percent-encoded, as in any
+URL (redis-py's from_url reads them the same way). Errors are CACHE-ERRORs
+that print the URL with the password masked (redis://user:***@host)."
+  (let ((shown (%redact-url url)))
+    (flet ((refuse (what)
+             ;; A URL with userinfo gets the escaping hint: an unescaped
+             ;; / ? # @ or % in a password is the usual cause.
+             (error 'cache-error
+                    :message (format nil "~A: ~A~:[~; (escape % / ? # @ in the user or ~
+                                          password as %25 %2F %3F %23 %40)~]"
+                                     what shown (find #\@ url)))))
+      (let* ((uri (handler-case (quri:uri url)
+                    (error () (refuse "malformed URL"))))
+             (scheme (and (quri:uri-scheme uri)
+                          (string-downcase (quri:uri-scheme uri)))))
+        (unless (member scheme '("redis" "rediss") :test #'equal)
+          (refuse "not a redis:// or rediss:// URL"))
+        (unless (and (quri:uri-host uri) (plusp (length (quri:uri-host uri))))
+          (refuse "no host in URL"))
+        ;; An unescaped / ? or # in the password ends quri's authority
+        ;; early, and the rest (with the @host) lands in the path, query or
+        ;; fragment. Refuse that rather than connect to the wrong host.
+        (when (some (lambda (part) (find #\@ (or part "")))
+                    (list (quri:uri-path uri) (quri:uri-query uri) (quri:uri-fragment uri)))
+          (refuse "malformed URL"))
+        (flet ((decode (text)
+                 (handler-case (quri:url-decode text)
+                   (error () (refuse "bad percent-escape in URL")))))
+          (let* ((userinfo (quri:uri-userinfo uri))
+                 (colon (and userinfo (position #\: userinfo)))
+                 (user (and userinfo
+                            (decode (subseq userinfo 0 (or colon (length userinfo))))))
+                 (password (and colon (decode (subseq userinfo (1+ colon)))))
+                 (path (string-trim "/" (or (quri:uri-path uri) ""))))
+            (list :host (quri:uri-host uri)
+                  :port (or (quri:uri-port uri) 6379)
+                  :username (and user (plusp (length user)) user)
+                  :password (and password (plusp (length password)) password)
+                  :db (if (plusp (length path)) (%parse-db path shown) 0)
+                  :tls (string= scheme "rediss"))))))))
 
 (defun make-redis-cache-backend (&rest args
                                        &key stream send-fn url host port username
@@ -269,7 +289,8 @@ also reads."
                                (usocket:socket-stream socket)))))
              (setf (redis-cache-backend-stream backend) stream)
              (%handshake backend stream)
-             (setf done t)
+             (setf done t
+                   (%ever-connected backend) t)
              stream)
         (unless done
           (%drop-connection backend))))))
@@ -294,30 +315,27 @@ is restarting gets time to come back."
 (defun %call (backend parts)
   "Send command PARTS and return the raw reply (a RESP-ERROR is returned,
 not signalled). On a managed connection a transport failure drops the
-socket. Once a connection has been up (at entry, or opened by an earlier
-attempt of this call), every failure, a refused reconnect included, is
-retried on a new connection, up to RETRIES resends (see %RETRY-PAUSE).
-A backend that never got a connection fails at once. Past that the
+socket. Once the backend has had a connection (%EVER-CONNECTED: in this
+call or in any earlier one, including a call that gave up), every
+failure, a refused reconnect included, is retried on a new connection, up
+to RETRIES resends per call (see %RETRY-PAUSE). A backend that never got
+a connection fails at once (wrong host or port). Past that the
 CACHE-CONNECTION-ERROR propagates with a RECONNECT restart."
   (let ((fn (redis-cache-backend-send-fn backend)))
     (if fn
         (funcall fn parts)
         (bt2:with-recursive-lock-held ((%lock backend))
-          (loop with established = (redis-cache-backend-connected-p backend)
-                for attempt from 0
+          (loop for attempt from 0
                 do (restart-case
                        (handler-bind
                            ((cache-connection-error
                              (lambda (e)
                                (declare (ignore e))
                                (%drop-connection backend)
-                               (when (and established
+                               (when (and (%ever-connected backend)
                                           (< attempt (redis-cache-backend-retries backend)))
                                  (invoke-restart 'reconnect)))))
-                         (let ((stream (%ensure-stream backend)))
-                           (when (%managed-p backend)
-                             (setf established t))
-                           (return (%roundtrip backend stream parts))))
+                         (return (%roundtrip backend (%ensure-stream backend) parts)))
                      (reconnect ()
                        :report "Reconnect to the server and send the command again."
                        :test (lambda (c)

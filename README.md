@@ -48,7 +48,7 @@ The connection opens on first use. A server without `HELLO` (Redis 5) gets `AUTH
 | server error reply (`WRONGPASS`, `SET ... EX 0`, `INCR` of `"abc"`, script error) | `cache-error` with the server's text and the key |
 | CAS mismatch | `cache-cas-mismatch` with restart `use-value` |
 
-Once the backend has had a connection, a dropped socket is retried transparently on a new one, up to `:retries` resends. Each resend counts, so `:retries 3` survives a server that drops the idle connection and then the first reconnect while it restarts; a refused reconnect is retried too, after the `:retry-delay` backoff. A backend that never connected fails at once (wrong host or port). Like redis-py, a command whose reply was lost may run twice. Past that the `cache-connection-error` carries a `reconnect` restart:
+Once the backend has had a connection, a dropped socket is retried transparently on a new one, up to `:retries` resends. Each resend counts, so `:retries 3` survives a server that drops the idle connection and then the first reconnect while it restarts; a refused reconnect is retried too, after the `:retry-delay` backoff, in that call and in every later one: a call that gave up while the server restarts does not make the next call fail fast. A backend that never connected fails at once (wrong host or port). Like redis-py, a command whose reply was lost may run twice. Past that the `cache-connection-error` carries a `reconnect` restart:
 
 ```lisp
 (handler-bind ((stack-cache:cache-connection-error
