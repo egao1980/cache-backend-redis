@@ -32,7 +32,7 @@ RESP3 Redis / Valkey backend for [`cache-protocol`](https://github.com/egao1980/
 | `:db` | `0` | `SELECT db` after the handshake |
 | `:tls` `:tls-verify` | `nil` `:required` | cl+ssl client stream with SNI and hostname check; the OS trust store comes from cl-stack-ssl |
 | `:client-name` | `nil` | `HELLO ... SETNAME` |
-| `:connect-timeout` | `5` | seconds for the connect and the TLS handshake, and for each wait on the server: a reply that stalls that long (over TLS on SBCL: a whole command) is a `cache-connection-error` |
+| `:connect-timeout` | `5` | seconds for the connect, the TLS handshake and each command: a server that does not answer in time is a `cache-connection-error`, not a hang (on SBCL a deadline per command; elsewhere usocket's socket timeout per wait) |
 | `:retries` | `1` | resends after a dropped socket or a refused reconnect |
 | `:retry-delay` | `1/10` | seconds before the second resend, doubled for each later one (capped at 2 s); the first resend goes at once |
 | `:stream` | | an `(unsigned-byte 8)` stream the caller owns (never closed by the backend) |

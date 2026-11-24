@@ -5,7 +5,7 @@
   :license "MIT"
   :depends-on ((:version "cache-protocol" "0.2.0") (:version "encoding-protocol" "0.3.0")
                "flexi-streams"
-               "usocket" "quri" "cl-stack-ssl" "bordeaux-threads")
+               "usocket" (:version "quri" "0.7.2") "cl-stack-ssl" "bordeaux-threads")
   :serial t
   :pathname "src"
   :components ((:file "package")

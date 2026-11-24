@@ -318,11 +318,13 @@ values masked (redis://user:***@host, see %REDACT-URL)."
       "redis stream"))
 
 (defun %call-with-io-deadline (backend thunk)
-  "Call THUNK. On SBCL a TLS connection runs it under a deadline of
-CONNECT-TIMEOUT seconds: cl+ssl reads and writes the socket itself, so the
-socket stream's own timeout (which bounds each wait on a plain connection)
-does not apply, and a server that stops answering would block for ever."
-  (let ((seconds (and (redis-cache-backend-tls backend)
+  "Call THUNK. On SBCL a managed connection runs it under a deadline of
+CONNECT-TIMEOUT seconds, so a command (or the connect and TLS handshake)
+that the server does not answer in time fails instead of blocking for
+ever. The socket stream's own timeout (usocket's :TIMEOUT) bounds each wait
+on a plain connection, but SBCL does not apply it on Windows, and cl+ssl
+reads the socket itself."
+  (let ((seconds (and (%managed-p backend)
                       (slot-value backend 'connect-timeout))))
     (if seconds
         #+sbcl (sb-sys:with-deadline (:seconds seconds) (funcall thunk))
@@ -330,15 +332,21 @@ does not apply, and a server that stops answering would block for ever."
         (funcall thunk))))
 
 (defmacro %with-transport-errors ((backend) &body body)
-  "Run BODY; a socket, stream or TLS failure becomes CACHE-CONNECTION-ERROR
-with the original condition as its CAUSE (the report prints it). The
-decoder's own CACHE-CONNECTION-ERROR (EOF mid-reply) has no endpoint; it
-is re-signalled with the endpoint, the decoder's condition as its cause.
-BODY runs under %CALL-WITH-IO-DEADLINE, and a deadline that passes is a
-transport failure too."
+  "Run BODY; a socket, name lookup, stream or TLS failure becomes
+CACHE-CONNECTION-ERROR with the original condition as its CAUSE (the
+report prints it). The decoder's own CACHE-CONNECTION-ERROR (EOF mid-reply)
+has no endpoint; it is re-signalled with the endpoint, the decoder's
+condition as its cause. BODY runs under %CALL-WITH-IO-DEADLINE, and a
+deadline that passes is a transport failure too."
   `(handler-case (%call-with-io-deadline ,backend (lambda () ,@body))
-     ;; cl+ssl exports no base condition; CL+SSL-ERROR is its root.
+     ;; cl+ssl exports no base condition; CL+SSL-ERROR is its root. On
+     ;; SBCL usocket leaves some failures unmapped: getaddrinfo's
+     ;; EAI_ADDRFAMILY (::1 on a host without IPv6) as
+     ;; SB-BSD-SOCKETS:NAME-SERVICE-ERROR, and EAFNOSUPPORT from connect on
+     ;; Windows as an SB-BSD-SOCKETS:SOCKET-ERROR.
      ((or usocket:socket-error usocket:ns-error stream-error cl+ssl::cl+ssl-error
+          #+sbcl sb-bsd-sockets:socket-error
+          #+sbcl sb-bsd-sockets:name-service-error
           #+sbcl sb-sys:deadline-timeout)
          (e)
        (error 'cache-connection-error :message (%endpoint ,backend) :cause e))

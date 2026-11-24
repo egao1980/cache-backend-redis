@@ -86,6 +86,29 @@
                (cache-protocol:cache-connection-error (e) e))))
       (ok (and e (search "[::1]:1" (princ-to-string e))) (format nil "report: ~A" e)))))
 
+(deftest connect-by-ipv6-url-with-a-password
+  ;; Userinfo in front of an IPv6 literal needs quri 0.7.2
+  ;; (egao1980/cl-stack-systems#85). Skips unless the live Valkey answers
+  ;; on ::1.
+  (with-side (side)
+    (%side side "SET" "r4-v6" "ok")
+    (let ((control (handler-case
+                       (with-redis-cache (c :host "::1" :port (%live-port)
+                                            :password (%live-password))
+                         (cache-protocol:cache-get c "r4-v6"))
+                     (error () nil))))
+      (if (not (equal "ok" control))
+          (skip "the live Valkey does not answer on ::1")
+          (let ((got (handler-case
+                         (with-redis-cache (c :url (format nil "redis://default:~A@[::1]:~D/0"
+                                                           (encoding-protocol:percent-encode
+                                                            (%live-password))
+                                                           (%live-port)))
+                           (cache-protocol:cache-get c "r4-v6"))
+                       (error (e) (list :error (princ-to-string e))))))
+            (ok (equal "ok" got)
+                (format nil "redis://default:***@[::1]:~D/0 got ~S" (%live-port) got)))))))
+
 ;;; --- an abandoned reply ------------------------------------------------------
 ;;;
 ;;; A reply the client stops reading half-way stays on the socket. If the
