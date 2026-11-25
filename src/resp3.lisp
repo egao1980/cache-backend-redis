@@ -90,20 +90,28 @@ restart (e.g. to keep the raw octets)."
 
 (defun %wire-text (x)
   "X as text for the wire: a string as is, anything else as PRINC writes it
-but with numbers in decimal, whatever the caller's *PRINT-BASE* and
-*PRINT-RADIX* (bulk lengths, SELECT, EX / PX, INCRBY, values)."
+under fixed printer settings, whatever the caller's: numbers in decimal
+(*PRINT-BASE* 10, no radix), a float without an exponent marker (0.1d0 →
+\"0.1\", as Redis and redis-py write it), a symbol upper-case (bulk
+lengths, SELECT, EX / PX, INCRBY, values)."
   (if (stringp x)
       x
       (let ((*print-base* 10)
-            (*print-radix* nil))
+            (*print-radix* nil)
+            (*print-case* :upcase)
+            (*read-default-float-format* (if (floatp x)
+                                             (type-of x)
+                                             *read-default-float-format*)))
         (princ-to-string x))))
 
 (defstruct (%secret (:constructor %secret (text))
                     (:copier nil)
                     (:predicate nil))
   "A command part that must not show up in a backtrace or a report (a
-password): it prints as #<SECRET ***>, and goes on the wire as its TEXT."
-  (text "" :type string :read-only t))
+password): it prints as #<SECRET ***>, and goes on the wire as its TEXT,
+any command part %PART-OCTETS takes (a string, octets, an integer, a
+symbol)."
+  (text "" :read-only t))
 
 (defmethod print-object ((secret %secret) stream)
   (print-unreadable-object (secret stream)
@@ -131,13 +139,21 @@ frame early and let the rest be read as another reply. Refuse them."
 
 (defun %part-octets (x)
   "A command part as octets: strings UTF-8, octet vectors as is, integers in
-decimal, a %SECRET as its text."
+decimal, a %SECRET as its text would be (an unsupported one is refused
+without showing it)."
   (etypecase x
     (string (%utf8-octets x))
     ((vector (unsigned-byte 8)) (coerce x '(simple-array (unsigned-byte 8) (*))))
     (symbol (%utf8-octets (string x)))
     (integer (%utf8-octets (%wire-text x)))
-    (%secret (%utf8-octets (%secret-text x)))))
+    (%secret
+     (let ((text (%secret-text x)))
+       (if (typep text '(or string (vector (unsigned-byte 8)) symbol integer))
+           (%part-octets text)
+           (error 'cache-error
+                  :message (format nil "a password must be a string, an octet vector, ~
+                                        a symbol or an integer, not a ~(~A~)"
+                                   (type-of text))))))))
 
 ;;; --- encode ----------------------------------------------------------------
 

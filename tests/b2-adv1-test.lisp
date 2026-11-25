@@ -435,6 +435,45 @@ $90: a server reads 90 octets as the value, skips two, and runs the other
                     (remove-if-not (lambda (line) (search "b2adv1-PASSWORD" line))
                                    (uiop:split-string backtrace :separator '(#\Newline))))))))
 
+(deftest-parametrize a-password-that-is-not-a-string-still-works
+    ((password)
+     ((map '(vector (unsigned-byte 8)) #'char-code "12345"))
+     (12345))
+  ;; redis-py takes bytes passwords; 0.2.0 sent octets and integers as is.
+  (with-scripted-server (srv (%fake-dispatch :password "12345"))
+    (let ((got (handler-case
+                   (with-redis-cache (c :host "127.0.0.1" :port (ss-port srv) :password password)
+                     (cache-protocol:cache-put c "k" "v")
+                     (cache-protocol:cache-get c "k"))
+                 (error (e) (format nil "~A: ~A" (type-of e) e)))))
+      (ok (equal "v" got) (format nil ":password ~A → \"v\" (got ~S)" (type-of password) got)))))
+
+(deftest an-unsupported-password-is-refused-without-showing-it
+  (with-scripted-server (srv (%fake-dispatch :password "pw"))
+    (let ((e (handler-case
+                 (with-redis-cache (c :host "127.0.0.1" :port (ss-port srv)
+                                      :password (list "b2adv1-PASSWORD"))
+                   (cache-protocol:cache-get c "k")
+                   nil)
+               (error (e) e))))
+      (ok (typep e 'cache-protocol:cache-error) (format nil "a cache-error (got ~A)" (type-of e)))
+      (ok (not (and e (search "b2adv1-PASSWORD" (princ-to-string e))))
+          (format nil "no password in: ~A" e)))))
+
+(deftest-parametrize floats-and-symbols-go-to-the-wire-in-a-fixed-form
+    ((value wire)
+     (0.1d0 "0.1")
+     (1.5f0 "1.5")
+     (:foo "FOO"))
+  (multiple-value-bind (c fake sent) (%recording-cache)
+    (declare (ignore fake))
+    (let ((*read-default-float-format* (if (typep value 'double-float) 'single-float 'double-float))
+          (*print-case* :downcase))
+      (cache-protocol:cache-put c "k" value))
+    (let ((put (first (funcall sent))))
+      (ok (equal wire (third put))
+          (format nil "~S under other printer settings → ~S (sent ~S)" value wire (third put))))))
+
 ;;; --- 9. URL errors show part of a password that holds / or ? ---------------
 ;;;
 ;;; %REDACT-URL: "This can over-mask a malformed URL, never under-mask it",

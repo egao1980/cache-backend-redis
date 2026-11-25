@@ -28,7 +28,7 @@ RESP3 Redis / Valkey backend for [`cache-protocol`](https://github.com/egao1980/
 |---|---|---|
 | `:host` `:port` | — `6379` | the backend owns a connection |
 | `:url` | | `redis://[[user]:password@]host[:port][/db][?db=N]`; `rediss://` turns TLS on. Explicit keywords win over URL parts (see [URLs](#urls)) |
-| `:username` `:password` | `nil` | sent as `HELLO 3 AUTH user pass` (`default` user when only a password is given; `AUTH user ""` for a username alone, an ACL `nopass` user, as in redis-py). The password never shows in a backtrace: it travels as `#<SECRET ***>` |
+| `:username` `:password` | `nil` | sent as `HELLO 3 AUTH user pass` (`default` user when only a password is given; `AUTH user ""` for a username alone, an ACL `nopass` user, as in redis-py). The password (a string, octets, an integer or a symbol) never shows in a backtrace: it travels as `#<SECRET ***>` |
 | `:db` | `0` | `SELECT db` after the handshake |
 | `:tls` `:tls-verify` | `nil` `:required` | cl+ssl client stream with SNI and hostname check; the OS trust store comes from cl-stack-ssl |
 | `:client-name` | `nil` | `HELLO ... SETNAME` |
@@ -81,7 +81,7 @@ Encoded types: simple string, error, integer, blob, array, null, map, set, bool,
 
 ## Wire encoding
 
-The codec reads and writes an `(unsigned-byte 8)` (or bivalent) stream. Text is UTF-8 through `encoding-protocol`: a bulk string is written as its UTF-8 octet count followed by the octets, and a reply is read by its octet length and then decoded, so non-ASCII keys and values round-trip and a value containing CRLF cannot start a second command. Numbers on the wire (lengths, `EX` / `PX`, `INCRBY`, `SELECT`, values) are always decimal, whatever the caller's `*print-base*` / `*print-radix*`. Simple strings and errors containing CR or LF are refused. Invalid UTF-8 in a reply signals `cache-error` with a `use-value` restart. So do a reply nested deeper than `*max-nesting-depth*` (64) levels and a double that is not a decimal number, `inf` or `-inf`; doubles are parsed without interning or reader macros.
+The codec reads and writes an `(unsigned-byte 8)` (or bivalent) stream. Text is UTF-8 through `encoding-protocol`: a bulk string is written as its UTF-8 octet count followed by the octets, and a reply is read by its octet length and then decoded, so non-ASCII keys and values round-trip and a value containing CRLF cannot start a second command. Numbers on the wire (lengths, `EX` / `PX`, `INCRBY`, `SELECT`, values) are always decimal, whatever the caller's `*print-base*` / `*print-radix*`; a float value goes without an exponent marker (`0.1d0` → `0.1`) and a symbol upper-case, whatever `*read-default-float-format*` / `*print-case*`. Simple strings and errors containing CR or LF are refused. Invalid UTF-8 in a reply signals `cache-error` with a `use-value` restart. So do a reply nested deeper than `*max-nesting-depth*` (64) levels and a double that is not a decimal number, `inf` or `-inf`; doubles are parsed without interning or reader macros.
 
 - `encode-resp3-command parts` → octets; `encode-resp3 value stream`, `decode-resp3 stream &key skip-push` on binary streams (`:skip-push t` reads past push frames to the next value).
 - `encode-resp3-to-octets` / `decode-resp3-from-octets`; `encode-resp3-to-string` / `decode-resp3-from-string` treat the string as the UTF-8 text of the wire.
