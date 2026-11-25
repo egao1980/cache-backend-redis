@@ -1,5 +1,5 @@
 (defsystem "cache-backend-redis"
-  :version "0.2.0"
+  :version "0.2.1"
   :description "RESP3 Redis/Valkey backend for cache-protocol (host/port or redis:// URL with AUTH, SELECT, TLS; or an injected stream / send-fn)"
   :author "egao1980"
   :license "MIT"
@@ -30,7 +30,8 @@
                (:file "evidence-r2-test")
                (:file "round3-test")
                (:file "evidence-r3-test")
-               (:file "round4-test"))
+               (:file "round4-test")
+               (:file "b2-adv1-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

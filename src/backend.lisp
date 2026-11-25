@@ -24,7 +24,7 @@ milliseconds or \"\" (no expiry). → 1 when swapped, else 0.")
     ((resp-error-p value)
      (error 'cache-error :message (resp-error-message value)))
     ((stringp value) value)
-    ((integerp value) (princ-to-string value))
+    ((integerp value) (%wire-text value))
     ((and (vectorp value) (not (stringp value)))
      (%utf8-string value))
     (t value)))
@@ -43,11 +43,11 @@ non-positive TTL is sent as is, and the server refuses it."
   (check-type ttl (or null real))
   (cond
    ((null ttl) nil)
-   ((integerp ttl) (list "EX" (princ-to-string ttl)))
-   (t (list "PX" (princ-to-string (%ttl-milliseconds ttl))))))
+   ((integerp ttl) (list "EX" (%wire-text ttl)))
+   (t (list "PX" (%wire-text (%ttl-milliseconds ttl))))))
 
 (defmethod cache-put ((cache redis-cache-backend) key value &key ttl)
-  (%command cache (append (list "SET" key (princ-to-string value))
+  (%command cache (append (list "SET" key (%wire-text value))
                           (%expiry-args ttl)))
   value)
 
@@ -59,7 +59,7 @@ non-positive TTL is sent as is, and the server refuses it."
   (check-type delta integer)
   (let ((reply (%command cache (if (= delta 1)
                                    (list "INCR" key)
-                                   (list "INCRBY" key (princ-to-string delta))))))
+                                   (list "INCRBY" key (%wire-text delta))))))
     (unless (integerp reply)
       (error 'cache-error :key key
                           :message (format nil "INCR replied ~s" reply)))
@@ -69,20 +69,20 @@ non-positive TTL is sent as is, and the server refuses it."
   (check-type ttl (or null real))
   (let ((reply (%command cache (list "EVAL" +cas-lua+ "1" key
                                      (if (null expected) "1" "0")
-                                     (if (null expected) "" (princ-to-string expected))
-                                     (princ-to-string new)
-                                     (if ttl (princ-to-string (%ttl-milliseconds ttl)) ""))
+                                     (if (null expected) "" (%wire-text expected))
+                                     (%wire-text new)
+                                     (if ttl (%wire-text (%ttl-milliseconds ttl)) ""))
                          :key key)))
     (cond
-     ((and (integerp reply) (plusp reply)) new)
-     (t
-      (let ((actual (cache-get cache key)))
-        (restart-case
-            (error 'cache-cas-mismatch
-                   :key key :expected expected :actual actual)
-          (use-value (value)
-            :report "Use a supplied value (treat CAS as success)"
-            value)))))))
+      ((and (integerp reply) (plusp reply)) new)
+      (t
+       (let ((actual (cache-get cache key)))
+         (restart-case
+             (error 'cache-cas-mismatch
+                    :key key :expected expected :actual actual)
+           (use-value (value)
+             :report "Use a supplied value (treat CAS as success)"
+             value)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; In-memory fake RESP server (tests; no live Valkey)
@@ -147,15 +147,15 @@ value must fit in (signed-byte 64). \"007\" and \"-0\" are refused."
   (let* ((cur (%fr-get server key))
          (n (if cur (%fr-integer cur) 0)))
     (cond
-     ((null n)
-      (make-resp-error "ERR value is not an integer or out of range"))
-     ((not (typep (+ n delta) '(signed-byte 64)))
-      (make-resp-error "ERR increment or decrement would overflow"))
-     (t
-      (let ((entry (gethash key (fake-redis-table server))))
-        (setf (gethash key (fake-redis-table server))
-              (cons (princ-to-string (+ n delta)) (and cur (cdr entry))))
-        (+ n delta))))))
+      ((null n)
+       (make-resp-error "ERR value is not an integer or out of range"))
+      ((not (typep (+ n delta) '(signed-byte 64)))
+       (make-resp-error "ERR increment or decrement would overflow"))
+      (t
+       (let ((entry (gethash key (fake-redis-table server))))
+         (setf (gethash key (fake-redis-table server))
+               (cons (%wire-text (+ n delta)) (and cur (cdr entry))))
+         (+ n delta))))))
 
 (defun %fr-hello (server args)
   "HELLO 3 [AUTH user pass] [SETNAME name] → a RESP3 map, or WRONGPASS / NOAUTH."

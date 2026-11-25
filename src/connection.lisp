@@ -128,12 +128,15 @@ takes it: an IPv6 literal ([::1], [fe80::1%25en0]) without its brackets.
 (defun %redact-url (url)
   "URL for an error report, with whatever may be a secret masked as ***:
 URLs come from configuration, and reports end up in logs. Masked are the
-password in the userinfo (all of the userinfo when it has no colon), a
-port that is not a number (redis://:password with no @host), every query
-value but db's (a redis-py URL may carry ?password=) and the fragment.
-The userinfo is taken to end at the LAST @, not at the first / ? or #, so
-a password that holds one of those unescaped (base64 passwords hold / + =)
-is masked too. This can over-mask a malformed URL, never under-mask it."
+password in the userinfo (all of the userinfo when it has no colon), every
+query value but db's (a redis-py URL may carry ?password=) and the
+fragment. A port that is not a number, or any port after an empty host
+with no @ (redis://:password with no @host), is taken to be a password:
+it and the rest of the URL are masked, since an unescaped / ? or # in it
+would otherwise end it early. The userinfo is taken to end at the LAST @,
+not at the first / ? or #, so a password that holds one of those
+unescaped (base64 passwords hold / + =) is masked too. This can over-mask
+a malformed URL, never under-mask it."
   (let* ((start (%url-authority-start url))
          (at (position #\@ url :start start :from-end t))
          (colon (and at (position #\: url :start start :end at)))
@@ -153,18 +156,21 @@ is masked too. This can over-mask a malformed URL, never under-mask it."
                    (write-string "***@" out))
             (at (write-string "***@" out)))
       (cond ((and port-colon
-                  (notevery #'digit-char-p (subseq url (1+ port-colon) host-end)))
+                  (or (and (null at) (= port-colon host-start))
+                      (notevery #'digit-char-p (subseq url (1+ port-colon) host-end))))
+             ;; A password, not a port: mask it through to the end.
              (write-string url out :start host-start :end (1+ port-colon))
              (write-string "***" out))
-            (t (write-string url out :start host-start :end host-end)))
-      (write-string tail out :end (or query hash (length tail)))
-      (when query
-        (format out "?~{~A~^&~}"
-                (mapcar #'%mask-query-item
-                        (uiop:split-string (subseq tail (1+ query) hash)
-                                           :separator "&"))))
-      (when hash
-        (write-string "#***" out)))))
+            (t
+             (write-string url out :start host-start :end host-end)
+             (write-string tail out :end (or query hash (length tail)))
+             (when query
+               (format out "?~{~A~^&~}"
+                       (mapcar #'%mask-query-item
+                               (uiop:split-string (subseq tail (1+ query) hash)
+                                                  :separator "&"))))
+             (when hash
+               (write-string "#***" out)))))))
 
 (defun %parse-db (text url)
   (handler-case (let ((n (parse-integer text)))
@@ -273,7 +279,13 @@ values masked (redis://user:***@host, see %REDACT-URL)."
    the connection.
  - :STREAM, an (unsigned-byte 8) stream the caller owns, or
  - :SEND-FN, a function of the command list returning the decoded reply."
-  (declare (ignore host port username password db tls))
+  (declare (ignore port username password db tls))
+  (when (and (or stream send-fn) (or url host))
+    ;; The backend would use the caller's channel yet count as managed, and
+    ;; close a stream it does not own. (No URL in the report: it may hold a
+    ;; password.)
+    (error 'cache-error
+           :message "make-redis-cache-backend: :stream / :send-fn cannot be given with :host / :url"))
   (let ((from-url (and url (parse-redis-url url))))
     (flet ((opt (key default)
              (let ((given (getf args key '%absent)))
@@ -351,6 +363,9 @@ too."
      ;; SB-BSD-SOCKETS:NAME-SERVICE-ERROR, and EAFNOSUPPORT from connect on
      ;; Windows as an SB-BSD-SOCKETS:SOCKET-ERROR.
      ((or usocket:socket-error usocket:ns-error stream-error cl+ssl::cl+ssl-error
+          ;; A certificate that does not name the host: cl+ssl signals it as a
+          ;; plain ERROR, outside CL+SSL-ERROR.
+          cl+ssl::hostname-verification-error
           #+sbcl sb-bsd-sockets:socket-error
           #+sbcl sb-bsd-sockets:name-service-error
           #+sbcl sb-sys:deadline-timeout)
@@ -384,18 +399,25 @@ too."
   (force-output stream))
 
 (defun %roundtrip (backend stream parts)
-  "Send PARTS on STREAM and read one reply. → raw RESP3 value. When this
-does not complete (a transport or protocol error, or a non-local exit such
-as a timeout around the call), a managed connection is dropped: its stream
-may still hold part of the reply, which the next command would read as its
-own."
+  "Send PARTS on STREAM and read one reply. → raw RESP3 value. Push frames
+before the reply are out-of-band (client tracking, pub/sub) and skipped. A
+-LOADING reply (a restarting server that is still loading its dataset) is a
+CACHE-CONNECTION-ERROR, as in redis-py, so %CALL reconnects and resends.
+When this does not complete (a transport or protocol error, or a non-local
+exit such as a timeout around the call), a managed connection is dropped:
+its stream may still hold part of the reply, which the next command would
+read as its own."
   (let ((done nil))
     (unwind-protect
-        (multiple-value-prog1
-            (%with-transport-errors (backend)
-              (%write-command stream parts)
-              (decode-resp3 stream))
-          (setf done t))
+        (let ((reply (%with-transport-errors (backend)
+                       (%write-command stream parts)
+                       (decode-resp3 stream :skip-push t))))
+          (when (and (resp-error-p reply)
+                     (eql 0 (search "LOADING" (resp-error-message reply))))
+            (error 'cache-connection-error :message (%endpoint backend)
+                                           :cause (resp-error-message reply)))
+          (setf done t)
+          reply)
       (unless done
         (%drop-connection backend)))))
 
@@ -416,31 +438,50 @@ own."
       (%server-error reply (first parts)))
     reply))
 
+(defun %wrong-arity-p (reply)
+  "Redis 5 answers AUTH user pass (it has no ACL users) with this."
+  (and (search "wrong number of arguments" (resp-error-message reply) :test #'char-equal)
+       t))
+
 (defun %handshake (backend stream)
-  "HELLO 3 [AUTH user pass] [SETNAME name], then SELECT. A server without
-HELLO gets AUTH / CLIENT SETNAME and stays on RESP2, which DECODE-RESP3
-also reads."
+  "HELLO 3 [AUTH user pass] [SETNAME name], then SELECT. A username without
+a password is sent as AUTH user \"\" (an ACL nopass user), as redis-py
+does. A server without HELLO gets AUTH / CLIENT SETNAME and stays on
+RESP2, which DECODE-RESP3 also reads; when it refuses AUTH user pass for
+its arity (Redis 5, no ACL), AUTH pass follows. The password travels as a
+%SECRET, so no frame of a backtrace shows it."
   (with-slots (username password db client-name) backend
-    (let ((reply (%roundtrip backend stream
-                             (append (list "HELLO" "3")
-                                     (when password
-                                       (list "AUTH" (or username "default") password))
-                                     (when client-name
-                                       (list "SETNAME" client-name))))))
+    (let* ((secret (and password (%secret password)))
+           (reply (%roundtrip backend stream
+                              (append (list "HELLO" "3")
+                                      (when (or secret username)
+                                        (list "AUTH" (or username "default") (or secret "")))
+                                      (when client-name
+                                        (list "SETNAME" client-name))))))
       (when (resp-error-p reply)
         (unless (%hello-unsupported-p reply)
           (%server-error reply "HELLO"))
-        (when password
-          (%expect-ok backend stream
-                      (append (list "AUTH") (when username (list username))
-                              (list password))))
+        (when secret
+          (let ((auth (%roundtrip backend stream
+                                  (append (list "AUTH") (when username (list username))
+                                          (list secret)))))
+            (when (and (resp-error-p auth) username (%wrong-arity-p auth))
+              (setf auth (%roundtrip backend stream (list "AUTH" secret))))
+            (when (resp-error-p auth)
+              (%server-error auth "AUTH"))))
         (when client-name
           (%expect-ok backend stream (list "CLIENT" "SETNAME" client-name)))))
     (unless (eql db 0)
-      (%expect-ok backend stream (list "SELECT" (princ-to-string db))))))
+      (%expect-ok backend stream (list "SELECT" (%wire-text db))))))
 
 (defun %connect (backend)
-  "Open the managed connection and run the handshake. → the stream."
+  "Open the managed connection and run the handshake. → the stream.
+On SBCL outside Windows a plain-TCP socket is made non-blocking once
+connected: a blocking write() to a server that stops reading would hang
+past the per-command deadline, while SBCL waits for a non-blocking one
+under it. (On Windows SBCL reads a socket with no timeout at all,
+cache-backend-redis#9; TLS goes through cl+ssl, which waits with the
+deadline.)"
   (with-slots (host port tls tls-verify connect-timeout) backend
     (let ((socket (%with-transport-errors (backend :deadline nil)
                     ;; usocket's own :TIMEOUT bounds the connect; a deadline around it
@@ -452,17 +493,21 @@ also reads."
           (done nil))
       (setf (%socket backend) socket)
       (unwind-protect
-           (let ((stream (%with-transport-errors (backend)
-                           (if tls
-                               (cl+ssl:make-ssl-client-stream
-                                (usocket:socket-stream socket)
-                                :hostname host :verify tls-verify)
-                               (usocket:socket-stream socket)))))
-             (setf (redis-cache-backend-stream backend) stream)
-             (%handshake backend stream)
-             (setf done t
-                   (%ever-connected backend) t)
-             stream)
+          (let ((stream (%with-transport-errors (backend)
+                          (cond
+                            (tls
+                             (cl+ssl:make-ssl-client-stream
+                              (usocket:socket-stream socket)
+                              :hostname host :verify tls-verify))
+                            (t
+                             #+(and sbcl (not win32))
+                             (setf (sb-bsd-sockets:non-blocking-mode (usocket:socket socket)) t)
+                             (usocket:socket-stream socket))))))
+            (setf (redis-cache-backend-stream backend) stream)
+            (%handshake backend stream)
+            (setf done t
+                  (%ever-connected backend) t)
+            stream)
         (unless done
           (%drop-connection backend))))))
 

@@ -28,15 +28,15 @@ RESP3 Redis / Valkey backend for [`cache-protocol`](https://github.com/egao1980/
 |---|---|---|
 | `:host` `:port` | — `6379` | the backend owns a connection |
 | `:url` | | `redis://[[user]:password@]host[:port][/db][?db=N]`; `rediss://` turns TLS on. Explicit keywords win over URL parts (see [URLs](#urls)) |
-| `:username` `:password` | `nil` | sent as `HELLO 3 AUTH user pass` (`default` user when only a password is given) |
+| `:username` `:password` | `nil` | sent as `HELLO 3 AUTH user pass` (`default` user when only a password is given; `AUTH user ""` for a username alone, an ACL `nopass` user, as in redis-py). The password (a string, octets, an integer or a symbol) never shows in a backtrace: it travels as `#<SECRET ***>` |
 | `:db` | `0` | `SELECT db` after the handshake |
 | `:tls` `:tls-verify` | `nil` `:required` | cl+ssl client stream with SNI and hostname check; the OS trust store comes from cl-stack-ssl |
 | `:client-name` | `nil` | `HELLO ... SETNAME` |
-| `:connect-timeout` | `5` | seconds for the connect, the TLS handshake and each command: a server that does not answer in time is a `cache-connection-error`, not a hang (on SBCL a deadline per command; elsewhere usocket's socket timeout per wait). Not over plain TCP on Windows, where SBCL reads a socket with no timeout ([#9](https://github.com/egao1980/cache-backend-redis/issues/9)) |
+| `:connect-timeout` | `5` | seconds for the connect, the TLS handshake and each command: a server that does not answer in time is a `cache-connection-error`, not a hang (on SBCL a deadline per command, writes included: outside Windows the plain-TCP socket is non-blocking once connected, so a server that stops reading cannot block a large write; elsewhere usocket's socket timeout per wait). Not over plain TCP on Windows, where SBCL reads a socket with no timeout ([#9](https://github.com/egao1980/cache-backend-redis/issues/9)) |
 | `:retries` | `1` | resends after a dropped socket or a refused reconnect |
 | `:retry-delay` | `1/10` | seconds before the second resend, doubled for each later one (capped at 2 s); the first resend goes at once |
-| `:stream` | | an `(unsigned-byte 8)` stream the caller owns (never closed by the backend) |
-| `:send-fn` | | a function of the command list returning the decoded reply (tests) |
+| `:stream` | | an `(unsigned-byte 8)` stream the caller owns (never closed by the backend). Refused with `:host` / `:url` |
+| `:send-fn` | | a function of the command list returning the decoded reply (tests). Refused with `:host` / `:url` |
 
 ### URLs
 
@@ -46,17 +46,18 @@ RESP3 Redis / Valkey backend for [`cache-protocol`](https://github.com/egao1980/
 - `?db=N` wins over the path (`redis://h/2?db=3` is db 3); a blank `?db=` is ignored and the first one counts. Any other query parameter is refused, not ignored. A fragment is ignored;
 - user, password, host, path and query are percent-decoded, so `/ ? # @ %` in a password are written `%2F %3F %23 %40 %25`.
 
-A bad URL signals `cache-error`. Its report masks what may be a secret: the password (all of the userinfo when it has no colon), a port that is not a number, every query value but `db`'s, and the fragment.
+A bad URL signals `cache-error`. Its report masks what may be a secret: the password (all of the userinfo when it has no colon), every query value but `db`'s, and the fragment. A port that is not a number, or a port after an empty host (`redis://:password` with no `@host`), is taken for a password: it and the rest of the URL are masked.
 
 ### Connection
 
-The connection opens on first use. A server without `HELLO` (Redis 5) gets `AUTH` / `CLIENT SETNAME` and stays on RESP2, which the decoder reads too. `close` releases the socket and returns `T` if one was open; the backend reconnects if it is used again. `with-redis-cache` closes on exit. Commands are serialized by a lock, so one backend can be shared between threads.
+The connection opens on first use. A server without `HELLO` (Redis 5) gets `AUTH` / `CLIENT SETNAME` and stays on RESP2, which the decoder reads too; it has no ACL users, so when it refuses `AUTH user pass` for its arity the backend sends `AUTH pass`, as redis-py does (`redis://default:pass@host` URLs work there). A username without a password sends no `AUTH` to it. RESP3 push frames (client tracking, pub/sub) are out-of-band: they are skipped, never taken as a command's reply. `close` releases the socket and returns `T` if one was open; the backend reconnects if it is used again. `with-redis-cache` closes on exit. Commands are serialized by a lock, so one backend can be shared between threads.
 
 ## Errors
 
 | situation | condition |
 |---|---|
-| refused / timed out connect, dropped socket, TLS failure, EOF | `cache-connection-error`, the usocket / stream / cl+ssl condition in `cause` |
+| refused / timed out connect, dropped socket, TLS failure (a certificate that does not name the host included), EOF | `cache-connection-error`, the usocket / stream / cl+ssl condition in `cause` |
+| `-LOADING` reply (a restarting server still loading its dataset) | `cache-connection-error`: the connection is dropped and the command resent, as for a dropped socket |
 | server error reply (`WRONGPASS`, `SET ... EX 0`, `INCR` of `"abc"`, script error) | `cache-error` with the server's text and the key |
 | CAS mismatch | `cache-cas-mismatch` with restart `use-value` |
 
@@ -80,9 +81,9 @@ Encoded types: simple string, error, integer, blob, array, null, map, set, bool,
 
 ## Wire encoding
 
-The codec reads and writes an `(unsigned-byte 8)` (or bivalent) stream. Text is UTF-8 through `encoding-protocol`: a bulk string is written as its UTF-8 octet count followed by the octets, and a reply is read by its octet length and then decoded, so non-ASCII keys and values round-trip and a value containing CRLF cannot start a second command. Simple strings and errors containing CR or LF are refused. Invalid UTF-8 in a reply signals `cache-error` with a `use-value` restart. So do a reply nested deeper than `*max-nesting-depth*` (64) levels and a double that is not a decimal number, `inf` or `-inf`; doubles are parsed without interning or reader macros.
+The codec reads and writes an `(unsigned-byte 8)` (or bivalent) stream. Text is UTF-8 through `encoding-protocol`: a bulk string is written as its UTF-8 octet count followed by the octets, and a reply is read by its octet length and then decoded, so non-ASCII keys and values round-trip and a value containing CRLF cannot start a second command. Numbers on the wire (lengths, `EX` / `PX`, `INCRBY`, `SELECT`, values) are always decimal, whatever the caller's `*print-base*` / `*print-radix*`; a float value goes without an exponent marker (`0.1d0` → `0.1`) and a symbol upper-case, whatever `*read-default-float-format*` / `*print-case*`. Simple strings and errors containing CR or LF are refused. Invalid UTF-8 in a reply signals `cache-error` with a `use-value` restart. So do a reply nested deeper than `*max-nesting-depth*` (64) levels and a double that is not a decimal number, `inf` or `-inf`; doubles are parsed without interning or reader macros.
 
-- `encode-resp3-command parts` → octets; `encode-resp3 value stream`, `decode-resp3 stream` on binary streams.
+- `encode-resp3-command parts` → octets; `encode-resp3 value stream`, `decode-resp3 stream &key skip-push` on binary streams (`:skip-push t` reads past push frames to the next value).
 - `encode-resp3-to-octets` / `decode-resp3-from-octets`; `encode-resp3-to-string` / `decode-resp3-from-string` treat the string as the UTF-8 text of the wire.
 
 ## Tests
@@ -94,7 +95,7 @@ docker run -d --name valkey-test -p 127.0.0.1:16390:6379 valkey/valkey:8 \
   valkey-server --save "" --appendonly no --requirepass s3cret
 ```
 
-The TLS test also wants `CACHE_REDIS_TEST_TLS_PORT` and `CACHE_REDIS_TEST_CA` (see the file header).
+The TLS test also wants `CACHE_REDIS_TEST_TLS_PORT` and `CACHE_REDIS_TEST_CA` (see the file header). `tests/b2-adv1-test.lisp` also reads `CACHE_REDIS_TEST_REDIS5_PORT` / `CACHE_REDIS_TEST_REDIS7_PORT` (`redis:5` / `redis:7` with the same `--requirepass`) and `CACHE_REDIS_TEST_TLS_WRONG_NAME_PORT` (a TLS Valkey whose certificate, signed by the test CA, names only `other.example`).
 
 ## License
 

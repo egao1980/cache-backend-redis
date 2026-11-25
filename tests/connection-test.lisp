@@ -90,11 +90,17 @@ a time. DROP-AFTER closes the first connection after that many replies."
         (format nil "wire: ~S" (ss-commands srv 1)))))
 
 (deftest handshake-without-password-or-db
+  ;; redis-py: a username alone is HELLO 3 AUTH user "" (an ACL nopass user).
   (with-scripted-server (srv (%fake-dispatch))
     (with-redis-cache (c :host "127.0.0.1" :port (ss-port srv) :username "app")
       (cache-protocol:cache-get c "k"))
+    (ok (equal '(("HELLO" "3" "AUTH" "app" "") ("GET" "k")) (ss-commands srv 1))
+        "a username without a password logs in with an empty one; no SELECT for db 0"))
+  (with-scripted-server (srv (%fake-dispatch))
+    (with-redis-cache (c :host "127.0.0.1" :port (ss-port srv))
+      (cache-protocol:cache-get c "k"))
     (ok (equal '(("HELLO" "3") ("GET" "k")) (ss-commands srv 1))
-        "no AUTH without a password, no SELECT for db 0")))
+        "no AUTH without a username or a password")))
 
 (deftest handshake-falls-back-without-hello
   ;; Redis 5: no HELLO. The backend authenticates with AUTH and stays on RESP2.

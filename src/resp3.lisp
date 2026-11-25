@@ -88,9 +88,38 @@ restart (e.g. to keep the raw octets)."
   (write-byte +cr+ stream)
   (write-byte +lf+ stream))
 
+(defun %wire-text (x)
+  "X as text for the wire: a string as is, anything else as PRINC writes it
+under fixed printer settings, whatever the caller's: numbers in decimal
+(*PRINT-BASE* 10, no radix), a float without an exponent marker (0.1d0 →
+\"0.1\", as Redis and redis-py write it), a symbol upper-case (bulk
+lengths, SELECT, EX / PX, INCRBY, values)."
+  (if (stringp x)
+      x
+      (let ((*print-base* 10)
+            (*print-radix* nil)
+            (*print-case* :upcase)
+            (*read-default-float-format* (if (floatp x)
+                                             (type-of x)
+                                             *read-default-float-format*)))
+        (princ-to-string x))))
+
+(defstruct (%secret (:constructor %secret (text))
+                    (:copier nil)
+                    (:predicate nil))
+  "A command part that must not show up in a backtrace or a report (a
+password): it prints as #<SECRET ***>, and goes on the wire as its TEXT,
+any command part %PART-OCTETS takes (a string, octets, an integer, a
+symbol)."
+  (text "" :read-only t))
+
+(defmethod print-object ((secret %secret) stream)
+  (print-unreadable-object (secret stream)
+    (write-string "SECRET ***" stream)))
+
 (defun %write-header (type-char n stream)
   (write-byte (char-code type-char) stream)
-  (%write-ascii (princ-to-string n) stream)
+  (%write-ascii (%wire-text n) stream)
   (%write-crlf stream))
 
 (defun %write-line-value (type-char string stream)
@@ -109,12 +138,22 @@ frame early and let the rest be read as another reply. Refuse them."
   (%write-crlf stream))
 
 (defun %part-octets (x)
-  "A command part as octets: strings UTF-8, octet vectors as is."
+  "A command part as octets: strings UTF-8, octet vectors as is, integers in
+decimal, a %SECRET as its text would be (an unsupported one is refused
+without showing it)."
   (etypecase x
     (string (%utf8-octets x))
     ((vector (unsigned-byte 8)) (coerce x '(simple-array (unsigned-byte 8) (*))))
     (symbol (%utf8-octets (string x)))
-    (integer (%utf8-octets (princ-to-string x)))))
+    (integer (%utf8-octets (%wire-text x)))
+    (%secret
+     (let ((text (%secret-text x)))
+       (if (typep text '(or string (vector (unsigned-byte 8)) symbol integer))
+           (%part-octets text)
+           (error 'cache-error
+                  :message (format nil "a password must be a string, an octet vector, ~
+                                        a symbol or an integer, not a ~(~A~)"
+                                   (type-of text))))))))
 
 ;;; --- encode ----------------------------------------------------------------
 
@@ -206,7 +245,9 @@ as the terminator; a CR not followed by LF is a protocol error."
           (t (vector-push-extend b out)))))))
 
 (defun %parse-int (s)
-  (parse-integer s :junk-allowed t))
+  "S as an integer, or NIL. One value only: %DECODE-RESP3 passes its second
+value through as the push-frame flag."
+  (values (parse-integer s :junk-allowed t)))
 
 (defun %ascii (octets &key (start 0))
   (map 'string #'code-char (subseq octets start)))
@@ -271,12 +312,9 @@ CACHE-ERROR."
         ((or reader-error arithmetic-error) () (bad))))
      (t (bad)))))
 
-(defun decode-resp3 (stream)
-  "Read one RESP3 value from the (unsigned-byte 8) STREAM. Blob strings are
-read by their octet length, then decoded as UTF-8. Verbatim strings lose
-their 3-letter format prefix, blob errors become RESP-ERROR, big numbers
-are integers, and an attribute map before a reply is skipped. Aggregates
-nested deeper than *MAX-NESTING-DEPTH* signal CACHE-ERROR."
+(defun %decode-resp3 (stream)
+  "Read one RESP3 value from STREAM (see DECODE-RESP3). → the value, and T
+as a second value when it was a push frame."
   (let ((*decode-depth* (1+ *decode-depth*)))
     (when (> *decode-depth* *max-nesting-depth*)
       (error 'cache-error
@@ -291,7 +329,9 @@ nested deeper than *MAX-NESTING-DEPTH* signal CACHE-ERROR."
                (let ((n (%parse-int (%ascii line :start 1))))
                  (if (or (null n) (< n 0))
                      nil
-                     (%utf8-string (%read-blob stream n))))))
+                     (%utf8-string (%read-blob stream n)))))
+             (elements (n)
+               (loop repeat n collect (values (%decode-resp3 stream)))))
         (case type
           (#\+ (make-resp-simple-string (rest-text)))
           (#\- (make-resp-error (rest-text)))
@@ -308,10 +348,9 @@ nested deeper than *MAX-NESTING-DEPTH* signal CACHE-ERROR."
                  (subseq text 4)
                  text)))
           ((#\* #\>)
-           (let ((n (%parse-int (rest-ascii))))
-             (if (or (null n) (< n 0))
-                 :resp-null
-                 (loop repeat n collect (decode-resp3 stream)))))
+           (let* ((n (%parse-int (rest-ascii)))
+                  (value (if (or (null n) (< n 0)) :resp-null (elements n))))
+             (values value (char= type #\>))))
           (#\_ :resp-null)
           (#\#
            (let ((rest (rest-ascii)))
@@ -324,19 +363,32 @@ nested deeper than *MAX-NESTING-DEPTH* signal CACHE-ERROR."
            (let ((n (or (%parse-int (rest-ascii)) 0)))
              (make-resp-map
               (loop repeat n
-                    collect (let* ((k (decode-resp3 stream))
-                                   (v (decode-resp3 stream)))
+                    collect (let* ((k (values (%decode-resp3 stream)))
+                                   (v (values (%decode-resp3 stream))))
                               (cons k v))))))
           (#\|
            ;; Attribute map: auxiliary data for the reply that follows.
            (let ((n (or (%parse-int (rest-ascii)) 0)))
-             (loop repeat (* 2 n) do (decode-resp3 stream))
-             (decode-resp3 stream)))
+             (loop repeat (* 2 n) do (%decode-resp3 stream))
+             (%decode-resp3 stream)))
           (#\~
            (let ((n (or (%parse-int (rest-ascii)) 0)))
-             (make-resp-set (loop repeat n collect (decode-resp3 stream)))))
+             (make-resp-set (elements n))))
           (t (error 'cache-error
                     :message (format nil "unknown RESP3 type byte ~s" type))))))))
+
+(defun decode-resp3 (stream &key skip-push)
+  "Read one RESP3 value from the (unsigned-byte 8) STREAM. Blob strings are
+read by their octet length, then decoded as UTF-8. Verbatim strings lose
+their 3-letter format prefix, blob errors become RESP-ERROR, big numbers
+are integers, and an attribute map before a reply is skipped. Aggregates
+nested deeper than *MAX-NESTING-DEPTH* signal CACHE-ERROR. A push frame
+(>) is a list; with SKIP-PUSH it is out-of-band data, as the RESP3 spec
+has it: it is read and dropped, and the value after it is returned."
+  (loop
+    (multiple-value-bind (value push-p) (%decode-resp3 stream)
+      (unless (and push-p skip-push)
+        (return value)))))
 
 (defun decode-resp3-from-octets (octets)
   "Decode one RESP3 value from wire OCTETS."
