@@ -1,5 +1,5 @@
 (defsystem "cache-backend-redis"
-  :version "0.2.0"
+  :version "0.2.1"
   :description "RESP3 Redis/Valkey backend for cache-protocol (host/port or redis:// URL with AUTH, SELECT, TLS; or an injected stream / send-fn)"
   :author "egao1980"
   :license "MIT"

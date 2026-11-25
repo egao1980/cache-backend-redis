@@ -175,6 +175,23 @@ $90: a server reads 90 octets as the value, skips two, and runs the other
 ;;; reply on the socket for the next command: every reply after it is one late.
 ;;; redis-py 8.2.0, same server: GET k → 'v', then GET other → 'other'.
 
+(deftest-parametrize skip-push-keeps-every-other-reply
+    ((wire expected)
+     (":3" 3)
+     ("(12345678901234567890" 12345678901234567890)
+     ("+OK" "OK")
+     ("*1" '("a"))
+     (">2" '("x" "y")))
+  ;; A reply that is a push frame is followed here by "$1 z": the push is
+  ;; skipped and z returned. Anything else is the reply itself.
+  (let* ((octets (if (char= #\> (char wire 0))
+                     (%wire wire "$1" "x" "$1" "y" "$1" "z")
+                     (%wire wire "$1" "a")))
+         (got (decode-resp3 (flexi-streams:make-in-memory-input-stream octets) :skip-push t))
+         (shown (if (resp-simple-string-p got) (resp-simple-string-value got) got)))
+    (ok (equal (if (char= #\> (char wire 0)) "z" expected) shown)
+        (format nil "~A with :skip-push → ~S (got ~S)" wire expected shown))))
+
 (deftest a-push-frame-is-not-the-reply
   (with-raw-server (srv (lambda (id parts s)
                           (declare (ignore id))
@@ -227,6 +244,31 @@ $90: a server reads 90 octets as the value, skips two, and runs the other
       (ok (equal "v" got)
           (format nil "redis://default:***@ to a Redis 5 → \"v\" (got ~S; wire ~S)"
                   got (mapcar #'cdr (ss-commands srv)))))))
+
+(deftest redis5-auth-retry-sends-the-password-alone
+  (with-scripted-server (srv (%redis5-dispatch (make-fake-redis) "pw"))
+    (with-redis-cache (c :host "127.0.0.1" :port (ss-port srv) :username "default" :password "pw")
+      (cache-protocol:cache-get c "k"))
+    (ok (equal '(("HELLO" "3" "AUTH" "default" "pw") ("AUTH" "default" "pw") ("AUTH" "pw")
+                 ("GET" "k"))
+               (ss-commands srv 1))
+        (format nil "wire: ~S" (ss-commands srv 1)))))
+
+(deftest redis5-username-without-a-password-sends-no-auth
+  ;; No HELLO and no password: nothing to authenticate with on Redis 5.
+  (with-scripted-server (srv (%redis5-dispatch (make-fake-redis) "pw"))
+    (with-redis-cache (c :host "127.0.0.1" :port (ss-port srv) :username "app")
+      (cache-protocol:cache-get c "k"))
+    (ok (equal '(("HELLO" "3" "AUTH" "app" "") ("GET" "k")) (ss-commands srv 1))
+        (format nil "wire: ~S" (ss-commands srv 1)))))
+
+(deftest redis5-wrong-password-is-still-refused
+  (with-scripted-server (srv (%redis5-dispatch (make-fake-redis) "pw"))
+    (with-redis-cache (c :host "127.0.0.1" :port (ss-port srv) :username "default" :password "no")
+      (let ((e (handler-case (progn (cache-protocol:cache-get c "k") nil)
+                 (cache-protocol:cache-error (e) e))))
+        (ok (and e (search "invalid password" (princ-to-string e)))
+            (format nil "AUTH pass refused → cache-error (got ~A)" e))))))
 
 (deftest live-redis5-with-a-username
   (let ((port (%env-port "CACHE_REDIS_TEST_REDIS5_PORT")))
@@ -404,7 +446,10 @@ $90: a server reads 90 octets as the value, skips two, and runs the other
     ((url)
      ("redis://:pass/WORD-b2adv1")
      ("redis://app:pass/WORD-b2adv1")
-     ("redis://:pass?WORD-b2adv1=1"))
+     ("redis://:pass?WORD-b2adv1=1")
+     ("redis://:pass#WORD-b2adv1")
+     ;; all digits before the /, so it reads as a port after an empty host
+     ("redis://:1234/WORD-b2adv1"))
   (let ((text (handler-case (progn (parse-redis-url url) "no error")
                 (cache-protocol:cache-error (e) (princ-to-string e)))))
     (ok (string/= "no error" text) (format nil "~A is refused" url))
@@ -429,3 +474,15 @@ $90: a server reads 90 octets as the value, skips two, and runs the other
         (cache-protocol:cache-error () nil)))
     (ok (or (eq c :refused) (open-stream-p io))
         ":url with :stream is refused, or the caller's stream stays open after an error")))
+
+(deftest-parametrize a-caller-channel-is-refused-next-to-a-host-or-url
+    ((args)
+     ((list :url "redis://u:b2adv1-PW@127.0.0.1:1/0" :stream (make-two-way-stream
+                                                              (make-string-input-stream "")
+                                                              (make-string-output-stream))))
+     ((list :host "127.0.0.1" :send-fn #'identity))
+     ((list :url "redis://127.0.0.1/0" :send-fn #'identity)))
+  (let ((e (handler-case (progn (apply #'make-redis-cache-backend args) nil)
+             (cache-protocol:cache-error (e) e))))
+    (ok (typep e 'cache-protocol:cache-error) (format nil "refused: ~A" e))
+    (ok (not (and e (search "b2adv1-PW" (princ-to-string e)))) "no password in the report")))

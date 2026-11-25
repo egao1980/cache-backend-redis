@@ -229,7 +229,9 @@ as the terminator; a CR not followed by LF is a protocol error."
           (t (vector-push-extend b out)))))))
 
 (defun %parse-int (s)
-  (parse-integer s :junk-allowed t))
+  "S as an integer, or NIL. One value only: %DECODE-RESP3 passes its second
+value through as the push-frame flag."
+  (values (parse-integer s :junk-allowed t)))
 
 (defun %ascii (octets &key (start 0))
   (map 'string #'code-char (subseq octets start)))
