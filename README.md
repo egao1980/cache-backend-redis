@@ -35,8 +35,12 @@ RESP3 Redis / Valkey backend for [`cache-protocol`](https://github.com/egao1980/
 | `:connect-timeout` | `5` | seconds for the connect, the TLS handshake and each command: a server that does not answer in time is a `cache-connection-error`, not a hang (on SBCL a deadline per command, writes included: outside Windows the plain-TCP socket is non-blocking once connected, so a server that stops reading cannot block a large write; elsewhere usocket's socket timeout per wait). Not over plain TCP on Windows, where SBCL reads a socket with no timeout ([#9](https://github.com/egao1980/cache-backend-redis/issues/9)) |
 | `:retries` | `1` | resends after a dropped socket or a refused reconnect |
 | `:retry-delay` | `1/10` | seconds before the second resend, doubled for each later one (capped at 2 s); the first resend goes at once |
-| `:stream` | | an `(unsigned-byte 8)` stream the caller owns (never closed by the backend). Refused with `:host` / `:url` |
-| `:send-fn` | | a function of the command list returning the decoded reply (tests). Refused with `:host` / `:url` |
+| `:stream` | | an `(unsigned-byte 8)` stream the caller owns (never closed by the backend) |
+| `:send-fn` | | a function of the command list returning the decoded reply (tests) |
+
+A caller's channel runs no handshake, so `:stream` and `:send-fn` are refused (`cache-error`) with each other and with any connection option: `:host`, `:url`, and a non-`nil` `:port`, `:username`, `:password`, `:db`, `:tls`, `:tls-verify` or `:client-name`.
+
+On a server without `HELLO` (Redis 5) the backend falls back to `AUTH`. A `:username` with no `:password` sends `AUTH user ""` there too, so Redis 5 refuses it at connect (as redis-py does) instead of a `NOAUTH` on the first command.
 
 ### URLs
 
@@ -46,7 +50,7 @@ RESP3 Redis / Valkey backend for [`cache-protocol`](https://github.com/egao1980/
 - `?db=N` wins over the path (`redis://h/2?db=3` is db 3); a blank `?db=` is ignored and the first one counts. Any other query parameter is refused, not ignored. A fragment is ignored;
 - user, password, host, path and query are percent-decoded, so `/ ? # @ %` in a password are written `%2F %3F %23 %40 %25`.
 
-A bad URL signals `cache-error`. Its report masks what may be a secret: the password (all of the userinfo when it has no colon), every query value but `db`'s, and the fragment. A port that is not a number, or a port after an empty host (`redis://:password` with no `@host`), is taken for a password: it and the rest of the URL are masked.
+A bad URL signals `cache-error`. Its report masks what may be a secret: the password (all of the userinfo when it has no colon), every query value but `db`'s, and the fragment. A port that is not a number, or a port after an empty host (`redis://:password` with no `@host`), is taken for a password: it and the rest of the URL are masked. A URL with no `://` (`redis:/:password`) is masked past its scheme (`redis:***`).
 
 ### Connection
 
@@ -81,7 +85,7 @@ Encoded types: simple string, error, integer, blob, array, null, map, set, bool,
 
 ## Wire encoding
 
-The codec reads and writes an `(unsigned-byte 8)` (or bivalent) stream. Text is UTF-8 through `encoding-protocol`: a bulk string is written as its UTF-8 octet count followed by the octets, and a reply is read by its octet length and then decoded, so non-ASCII keys and values round-trip and a value containing CRLF cannot start a second command. Numbers on the wire (lengths, `EX` / `PX`, `INCRBY`, `SELECT`, values) are always decimal, whatever the caller's `*print-base*` / `*print-radix*`; a float value goes without an exponent marker (`0.1d0` → `0.1`) and a symbol upper-case, whatever `*read-default-float-format*` / `*print-case*`. Simple strings and errors containing CR or LF are refused. Invalid UTF-8 in a reply signals `cache-error` with a `use-value` restart. So do a reply nested deeper than `*max-nesting-depth*` (64) levels and a double that is not a decimal number, `inf` or `-inf`; doubles are parsed without interning or reader macros.
+The codec reads and writes an `(unsigned-byte 8)` (or bivalent) stream. Text is UTF-8 through `encoding-protocol`: a bulk string is written as its UTF-8 octet count followed by the octets, and a reply is read by its octet length and then decoded, so non-ASCII keys and values round-trip and a value containing CRLF cannot start a second command. Numbers on the wire (lengths, `EX` / `PX`, `INCRBY`, `SELECT`, values) are always decimal, whatever the caller's `*print-base*` / `*print-radix*`; a float value goes without an exponent marker (`0.1d0` → `0.1`) and a symbol upper-case, whatever `*read-default-float-format*` / `*print-case*`. A ratio or complex value (`1/3`) has no text Redis reads as that number, so it signals `cache-error` before anything is sent: pass `(float x)` or a string of your own. Simple strings and errors containing CR or LF are refused. Invalid UTF-8 in a reply signals `cache-error` with a `use-value` restart. So do a reply nested deeper than `*max-nesting-depth*` (64) levels and a double that is not a decimal number, `inf` or `-inf`; doubles are parsed without interning or reader macros.
 
 - `encode-resp3-command parts` → octets; `encode-resp3 value stream`, `decode-resp3 stream &key skip-push` on binary streams (`:skip-push t` reads past push frames to the next value).
 - `encode-resp3-to-octets` / `decode-resp3-from-octets`; `encode-resp3-to-string` / `decode-resp3-from-string` treat the string as the UTF-8 text of the wire.
