@@ -135,8 +135,16 @@ with no @ (redis://:password with no @host), is taken to be a password:
 it and the rest of the URL are masked, since an unescaped / ? or # in it
 would otherwise end it early. The userinfo is taken to end at the LAST @,
 not at the first / ? or #, so a password that holds one of those
-unescaped (base64 passwords hold / + =) is masked too. This can over-mask
-a malformed URL, never under-mask it."
+unescaped (base64 passwords hold / + =) is masked too. A URL with no ://
+(redis:/:password) has no authority to tell a password from: all of it
+past the scheme is masked. This can over-mask a malformed URL, never
+under-mask it."
+  (unless (search "://" url)
+    (let ((colon (position #\: url)))
+      (return-from %redact-url
+        (if colon
+            (concatenate 'string (subseq url 0 (1+ colon)) "***")
+            "***"))))
   (let* ((start (%url-authority-start url))
          (at (position #\@ url :start start :from-end t))
          (colon (and at (position #\: url :start start :end at)))
@@ -278,14 +286,33 @@ values masked (redis://user:***@host, see %REDACT-URL)."
    :VERIFY (:REQUIRED by default). CL:CLOSE or WITH-REDIS-CACHE releases
    the connection.
  - :STREAM, an (unsigned-byte 8) stream the caller owns, or
- - :SEND-FN, a function of the command list returning the decoded reply."
+ - :SEND-FN, a function of the command list returning the decoded reply.
+A caller's channel (:STREAM or :SEND-FN, only one of them) takes none of
+the connection options: :HOST, :URL, :PORT, :USERNAME, :PASSWORD, :DB,
+:TLS, :TLS-VERIFY and :CLIENT-NAME (non-NIL) signal CACHE-ERROR rather
+than be ignored, since no handshake runs on it."
   (declare (ignore port username password db tls))
+  (when (and stream send-fn)
+    (error 'cache-error
+           :message "make-redis-cache-backend: give :stream or :send-fn, not both"))
   (when (and (or stream send-fn) (or url host))
     ;; The backend would use the caller's channel yet count as managed, and
     ;; close a stream it does not own. (No URL in the report: it may hold a
     ;; password.)
     (error 'cache-error
            :message "make-redis-cache-backend: :stream / :send-fn cannot be given with :host / :url"))
+  (when (or stream send-fn)
+    ;; No handshake runs on a caller's channel: these would be dropped
+    ;; silently. (Only the names in the report, never a value.)
+    (let ((ignored (loop for key in '(:port :username :password :db :tls :tls-verify :client-name)
+                         when (getf args key)
+                           collect key)))
+      (when ignored
+        (error 'cache-error
+               :message (format nil "make-redis-cache-backend: ~{~(~S~)~^, ~} cannot be given ~
+                                     with :stream / :send-fn (no handshake runs on a caller's ~
+                                     channel)"
+                                ignored)))))
   (let ((from-url (and url (parse-redis-url url))))
     (flet ((opt (key default)
              (let ((given (getf args key '%absent)))
@@ -448,8 +475,10 @@ read as its own."
 a password is sent as AUTH user \"\" (an ACL nopass user), as redis-py
 does. A server without HELLO gets AUTH / CLIENT SETNAME and stays on
 RESP2, which DECODE-RESP3 also reads; when it refuses AUTH user pass for
-its arity (Redis 5, no ACL), AUTH pass follows. The password travels as a
-%SECRET, so no frame of a backtrace shows it."
+its arity (Redis 5, no ACL), AUTH pass follows. A username without a
+password gets AUTH user \"\" there too, so Redis 5 refuses it at connect
+(as redis-py does), not with NOAUTH on the first command. The password
+travels as a %SECRET, so no frame of a backtrace shows it."
   (with-slots (username password db client-name) backend
     (let* ((secret (and password (%secret password)))
            (reply (%roundtrip backend stream
@@ -461,10 +490,11 @@ its arity (Redis 5, no ACL), AUTH pass follows. The password travels as a
       (when (resp-error-p reply)
         (unless (%hello-unsupported-p reply)
           (%server-error reply "HELLO"))
-        (when secret
-          (let ((auth (%roundtrip backend stream
-                                  (append (list "AUTH") (when username (list username))
-                                          (list secret)))))
+        (when (or secret username)
+          (let* ((secret (or secret ""))
+                 (auth (%roundtrip backend stream
+                                   (append (list "AUTH") (when username (list username))
+                                           (list secret)))))
             (when (and (resp-error-p auth) username (%wrong-arity-p auth))
               (setf auth (%roundtrip backend stream (list "AUTH" secret))))
             (when (resp-error-p auth)

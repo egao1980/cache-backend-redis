@@ -93,7 +93,14 @@ restart (e.g. to keep the raw octets)."
 under fixed printer settings, whatever the caller's: numbers in decimal
 (*PRINT-BASE* 10, no radix), a float without an exponent marker (0.1d0 →
 \"0.1\", as Redis and redis-py write it), a symbol upper-case (bulk
-lengths, SELECT, EX / PX, INCRBY, values)."
+lengths, SELECT, EX / PX, INCRBY, values). A ratio or a complex has no
+text Redis reads as that number (1/3 is not \"0.333…\"), so it signals
+CACHE-ERROR: convert it first (FLOAT, or a string of your own)."
+  (when (typep x '(or ratio complex))
+    (error 'cache-error
+           :message (format nil "a ~(~A~) has no Redis wire form: ~S (convert it with FLOAT ~
+                                 or to a string first)"
+                            (if (typep x 'ratio) 'ratio 'complex) x)))
   (if (stringp x)
       x
       (let ((*print-base* 10)

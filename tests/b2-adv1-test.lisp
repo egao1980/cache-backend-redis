@@ -254,14 +254,6 @@ $90: a server reads 90 octets as the value, skips two, and runs the other
                (ss-commands srv 1))
         (format nil "wire: ~S" (ss-commands srv 1)))))
 
-(deftest redis5-username-without-a-password-sends-no-auth
-  ;; No HELLO and no password: nothing to authenticate with on Redis 5.
-  (with-scripted-server (srv (%redis5-dispatch (make-fake-redis) "pw"))
-    (with-redis-cache (c :host "127.0.0.1" :port (ss-port srv) :username "app")
-      (cache-protocol:cache-get c "k"))
-    (ok (equal '(("HELLO" "3" "AUTH" "app" "") ("GET" "k")) (ss-commands srv 1))
-        (format nil "wire: ~S" (ss-commands srv 1)))))
-
 (deftest redis5-wrong-password-is-still-refused
   (with-scripted-server (srv (%redis5-dispatch (make-fake-redis) "pw"))
     (with-redis-cache (c :host "127.0.0.1" :port (ss-port srv) :username "default" :password "no")
